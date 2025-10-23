@@ -1,66 +1,75 @@
 # llama.cpp Installer for Windows
 
-This project provides a PowerShell script to automate the setup of the `llama.cpp` development environment on Windows. It installs all the necessary prerequisites, including the CUDA Toolkit, and builds `llama.cpp` from the source.
+This project provides a PowerShell script to automate the setup of the `llama.cpp` development environment on Windows. It installs all required prerequisites **silently**, selects an appropriate **CUDA Toolkit** version, and builds `llama.cpp` from source.
+
+## What’s new
+
+* **No more `-CudaArch` flag.** The script auto-detects your GPU’s SM (compute capability) via the NVIDIA driver (**NVML**).
+  If detection isn’t possible, it falls back to `CMAKE_CUDA_ARCHITECTURES=native`.
+* **Headless VS Build Tools install (via winget).** Includes the Windows SDK and required C++ components—no GUI.
+* **Sane CUDA selection.** If your GPU is **pre-Turing (SM < 70)**, the script uses **CUDA 12.4** for compatibility; otherwise it uses the latest installed (≥ 12.4).
 
 ## Prerequisites
 
-*   Windows 10/11 x64
-*   PowerShell 5 (or 7)
-*   NVIDIA GPU with CUDA 12.4+ support
-*   ~20 GB of free disk space
+* Windows 10/11 x64
+* PowerShell 5 or 7
+* Recent **NVIDIA driver** (no CUDA toolkit required)
+* ~20 GB free disk space
+* **App Installer / winget** available (to install dependencies)
+* **Administrator** rights (elevated PowerShell)
+
+> The GPU SM auto-detect uses `nvml.dll` from the NVIDIA driver. If NVML isn’t available, the script falls back to a WMI-based heuristic and then to `CMAKE_CUDA_ARCHITECTURES=native`.
+
+## What the installer does
+
+1. **Admin check** (must be elevated).
+2. **Installs prerequisites** if missing (silent, via `winget`):
+
+   * Git
+   * CMake
+   * **Visual Studio 2022 Build Tools** (with C++ toolchain and **Windows SDK**)
+   * Ninja (and a portable fallback if needed)
+3. **Chooses CUDA Toolkit**:
+
+   * Detects your GPU’s **SM** via NVML.
+   * **SM < 70 (pre-Turing)** → installs/uses **CUDA 12.4**.
+   * **SM ≥ 70** or unknown → uses latest installed CUDA (≥ 12.4).
+4. **Clones and builds `llama.cpp`** under `vendor\llama.cpp`.
 
 ## Installation
 
-The installation process is handled by a single PowerShell script. It will perform the following steps:
-
-1.  **Check for Administrator Privileges**: The script requires elevated permissions to install software.
-2.  **Install Prerequisites**: It uses `winget` to install the following tools if they are not already present:
-    *   Git
-    *   CMake
-    *   Visual Studio 2022 Build Tools
-    *   Ninja Build System
-3.  **Install CUDA Toolkit**: It checks for a compatible CUDA installation (version 12.4 or newer). If not found, it will be installed.
-4.  **Clone and Build `llama.cpp`**: The script clones the official `llama.cpp` repository from GitHub into a `vendor` subdirectory, and then it compiles the source code.
-
-To start the installation, run the `install_llama_cpp.ps1` script from an **elevated** PowerShell prompt.
+Run from an **elevated** PowerShell prompt:
 
 ```powershell
 # Allow script execution for this session
 Set-ExecutionPolicy Bypass -Scope Process
 
-# Run the installer (it will auto-detect the CUDA architecture for your GPU)
+# Run the installer (auto-detects GPU SM; falls back to native)
 ./install_llama_cpp.ps1
 ```
 
-You can also specify the CUDA architecture for your GPU with the `-CudaArch` parameter. This is useful if the auto-detection fails or if you want to build for a different GPU.
-
-| Architecture  | Cards (examples)   | Flag         |
-| ------------- | ------------------ | ------------ |
-| **Pascal**    | GTX 10×0, Quadro P | 60 / 61 / 62 |
-| **Turing**    | RTX 20×0 / 16×0    | 75           |
-| **Ampere**    | RTX 30×0           | 80 / 86 / 87 |
-| **Ada**       | RTX 40×0           | 89           |
-| **Blackwell** | RTX 50×0           | 90           |
-
-For example, to build for an RTX 30-series GPU, you would run:
+Optional: skip the build step (installs prerequisites + CUDA only):
 
 ```powershell
-./install_llama_cpp.ps1 -CudaArch 86
+./install_llama_cpp.ps1 -SkipBuild
+```
+
+The built binaries will be in:
+
+```
+vendor\llama.cpp\build\bin
 ```
 
 ## Uninstallation
 
-To remove the installed software and the cloned `llama.cpp` repository, you can run the `uninstall_llama_cpp.ps1` script from an **elevated** PowerShell prompt.
+Run from an **elevated** PowerShell prompt:
 
 ```powershell
-# Allow script execution for this session
 Set-ExecutionPolicy Bypass -Scope Process
-
-# Run the uninstaller
 ./uninstall_llama_cpp.ps1
 ```
 
-This will uninstall the prerequisites (Git, CMake, VS Build Tools, Ninja, and CUDA) and remove the `vendor` directory.
+This removes the winget-installed prerequisites and the `vendor` directory (and portable Ninja if it was created).
 
 ## Running the Server
 
@@ -81,6 +90,14 @@ You can also specify the number of CPU threads to use with the `-Threads` parame
 ```powershell
 ./run_llama_cpp_server.ps1 -Threads 12
 ```
+
+## Troubleshooting
+
+* **winget not found**: Install “App Installer” from the Microsoft Store, then re-run.
+* **Pending reboot**: Some installs require a reboot (Windows Update/VS Installer). Reboot and re-run.
+* **CUDA side-by-side**: Multiple CUDA toolkits can co-exist; the uninstaller can remove them via winget.
+* **NVML missing**: The script falls back to a heuristic and then `CMAKE_CUDA_ARCHITECTURES=native`.
+* **Locked files**: Stop `llama-server`/`llama-cli` before uninstalling.
 
 ## License
 
