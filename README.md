@@ -62,6 +62,26 @@ Set-ExecutionPolicy Bypass -Scope Process
 
 This will uninstall the prerequisites (Git, CMake, VS Build Tools, Ninja, and CUDA) and remove the `vendor` directory.
 
+## Running the Server
+
+The `run_llama_cpp_server.ps1` script provides a convenient way to start the `llama.cpp` server with the Qwen3-4B model.
+
+1.  **Downloads the Model**: It automatically downloads the `Qwen3-4B-Instruct-2507-Q8_0-GGUF` model to a `models` subdirectory if it's not already present.
+2.  **Starts the Server**: It launches the `llama-server.exe` with parameters optimized for the Qwen3-4B model.
+3.  **Opens Web UI**: After starting the server, it automatically opens `http://localhost:8080` in your default web browser.
+
+To run the server, use the following command in PowerShell:
+
+```powershell
+./run_llama_cpp_server.ps1
+```
+
+You can also specify the number of CPU threads to use with the `-Threads` parameter:
+
+```powershell
+./run_llama_cpp_server.ps1 -Threads 12
+```
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
