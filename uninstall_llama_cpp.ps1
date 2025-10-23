@@ -69,23 +69,32 @@ function Remove-FromMachinePath([string]$Dir) {
 # Run winget non-interactively to uninstall a package
 function Uninstall-Winget {
     param(
-        [Parameter(Mandatory=$true)][string]$Id
+        [Parameter(Mandatory=$true)][string]$Id,
+        [switch]$AllVersions
     )
-    if (-not (Test-Command winget)) {
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
         Write-Warning "The 'winget' command is not available. Skipping uninstallation of $Id."
         return
     }
     Write-Host "-> uninstalling $Id ..."
     $argList = @(
-        'uninstall','--id',$Id,
+        'uninstall','--id',$Id,'--exact',
         '--source','winget',
         '--silent','--disable-interactivity',
         '--accept-source-agreements','--force'
     )
+    if ($AllVersions) { $argList += '--all-versions' }
 
     $log = Join-Path $env:TEMP ("winget_uninstall_{0}.log" -f ($Id -replace '[^A-Za-z0-9]+','_'))
     & winget @argList *> $log
     $exitCode = $LASTEXITCODE
+
+    # Retry automatically if multiple versions are installed
+    if ($exitCode -eq -1978335210 -and -not $AllVersions) {
+        Write-Host "  Multiple versions found; uninstalling all of them ..."
+        & winget @($argList + '--all-versions') *> $log
+        $exitCode = $LASTEXITCODE
+    }
 
     # -1978335212: WINGET_ERR_NO_PACKAGE_FOUND (already uninstalled or never installed)
     # 1603 = "Fatal error during installation" (often means "already uninstalled")
@@ -173,14 +182,14 @@ if (Test-Path $ninjaDir) {
 $reqs = @(
     'Kitware.CMake',
     'Ninja-build.Ninja',
-    'Microsoft.VisualStudio.2022.BuildTools',
-    'Nvidia.CUDA'
+    'Microsoft.VisualStudio.2022.BuildTools'
 )
 
 Write-Host "--- Uninstalling winget packages ---"
 foreach ($r in $reqs) {
     Uninstall-Winget -Id $r
 }
+Uninstall-Winget -Id 'Nvidia.CUDA' -AllVersions
 
 Write-Host ""
 Write-Host "--- Removing cloned llama.cpp repository ---"
