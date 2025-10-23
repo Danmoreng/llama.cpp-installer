@@ -1,0 +1,16 @@
+# Ignore downloaded models
+/models/
+
+# Ignore cloned and built vendor dependencies
+/vendor/
+
+# Ignore log files
+/llama.log
+
+# Ignore IDE and editor-specific files
+.idea/
+.vscode/
+.vs/
+*.suo
+*.user
+*.sln.docstates
