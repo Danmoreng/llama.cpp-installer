@@ -171,7 +171,6 @@ if (Test-Path $ninjaDir) {
 }
 
 $reqs = @(
-    'Git.Git',
     'Kitware.CMake',
     'Ninja-build.Ninja',
     'Microsoft.VisualStudio.2022.BuildTools',
