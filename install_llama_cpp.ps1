@@ -7,12 +7,11 @@
     • Uses the Ninja generator (fast, no VS-integration dependency)
     • Re-usable: just run the script; it installs only what is missing
     • Pass -CudaArch <SM> to target a different GPU
-      (defaults to 89 = Ada; GTX-1070 = 61, RTX-30-series = 86, etc.)
+      (89 = Ada; GTX-1070 = 61, RTX-30-series = 86, etc.)
 #>
 
 [CmdletBinding()]
 param(
-    [int]   $CudaArch = 61,
     [switch]$SkipBuild
 )
 
@@ -42,10 +41,27 @@ function Test-Command ([string]$Name) {
 function Test-VSTools {
     $vswhere = Join-Path ${Env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     if (-not (Test-Path $vswhere)) { return $false }
-    $path = & $vswhere -latest -products * `
-            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-            -property installationPath 2>$null
-    -not [string]::IsNullOrWhiteSpace($path)
+
+    $instRoot = & $vswhere -latest -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationPath 2>$null
+
+    if ([string]::IsNullOrWhiteSpace($instRoot)) { return $false }
+
+    $vcvars = Join-Path $instRoot 'VC\Auxiliary\Build\vcvars64.bat'
+    if (-not (Test-Path $vcvars)) { return $false }
+
+    $cl = Get-ChildItem -Path (Join-Path $instRoot 'VC\Tools\MSVC') `
+        -Recurse -Filter cl.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $cl) { return $false }
+
+    # Windows SDK tools (needed by CMake generator/linker steps)
+    $sdkBin = 'C:\Program Files (x86)\Windows Kits\10\bin'
+    $rc = Get-ChildItem $sdkBin -Recurse -Filter rc.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    $mt = Get-ChildItem $sdkBin -Recurse -Filter mt.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not ($rc -and $mt)) { return $false }
+
+    return $true
 }
 
 # --- CUDA: generic discovery (12.4+ including 13.x) -------------------------
@@ -209,15 +225,56 @@ function Install-Winget {
 }
 
 function Install-VSTools {
-    Write-Host "-> downloading and installing VS 2022 Build Tools ..."
-    $url  = 'https://aka.ms/vs/17/release/vs_BuildTools.exe'
-    $exe  = Join-Path $env:TEMP 'vs_BuildTools.exe'
-    Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
-    $args = '--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet --norestart --wait'
-    $p = Start-Process -FilePath $exe -ArgumentList $args -NoNewWindow -Wait -PassThru
-    if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
-        throw "VS Build Tools installer failed with exit code $($p.ExitCode)."
+    # Require winget (silent + no GUI)
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        throw "The 'winget' command is not available. Install the Microsoft 'App Installer' from the Store and try again."
     }
+
+    Write-Host "-> installing VS 2022 Build Tools (silent, via winget) ..."
+    $installPath = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools'
+
+    # Common component set
+    $customCommon = @(
+        '--add Microsoft.VisualStudio.Workload.VCTools',
+        '--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+        '--add Microsoft.VisualStudio.Component.VC.CoreBuildTools',
+        '--add Microsoft.VisualStudio.Component.VC.Redist.14.Latest',
+        '--includeRecommended',
+        ('--installPath "{0}"' -f $installPath)
+    ) -join ' '
+
+    # Prefer Win11 SDK; fall back to Win10 SDK if not available on this machine/feed
+    $customWin11 = "$customCommon --add Microsoft.VisualStudio.Component.Windows11SDK.22621"
+    $customWin10 = "$customCommon --add Microsoft.VisualStudio.Component.Windows10SDK.19041"
+
+    $logDir = Join-Path $env:TEMP "vsbuildtools_logs"
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    $log = Join-Path $logDir "winget_vstools.log"
+
+    # Kill any running VS installer UI just in case
+    Get-Process -Name "vs_installer","VisualStudioInstaller" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+    # Helper to invoke winget silently with a given --custom payload
+    function Invoke-VsInstall([string]$customArgs) {
+        & winget install --id Microsoft.VisualStudio.2022.BuildTools `
+            --source winget `
+            --silent --disable-interactivity `
+            --accept-source-agreements --accept-package-agreements `
+            --custom $customArgs *> $log
+        return $LASTEXITCODE
+    }
+
+    # Try Win11 SDK set first; if that fails, try Win10 SDK set
+    $code = Invoke-VsInstall $customWin11
+    if ($code -ne 0 -and $code -ne 3010) {
+        Write-Host "  Win11 SDK component not available; retrying with Win10 SDK ..."
+        $code = Invoke-VsInstall $customWin10
+    }
+
+    if ($code -ne 0 -and $code -ne 3010) {
+        throw "VS Build Tools install failed (exit $code). See log: $log"
+    }
+
     Refresh-Env
 }
 
@@ -233,6 +290,11 @@ function Import-VSEnv {
     if (-not $vsroot) { throw "VS Build Tools not found." }
 
     $vcvars = Join-Path $vsroot 'VC\Auxiliary\Build\vcvars64.bat'
+    if (-not (Test-Path $vcvars)) {
+        throw "VS C++ Build Tools look registered at '$vsroot' but vcvars64.bat is missing.
+Try re-installing the Build Tools with the Windows SDK component (see Install-VSTools)."
+    }
+
     Write-Host "  importing MSVC environment from $vcvars"
     $envDump = cmd /s /c "`"$vcvars`" && set"
     foreach ($line in $envDump -split "`r?`n") {
@@ -289,32 +351,93 @@ function Use-LatestCuda {
     "-DCUDAToolkit_ROOT=$($pick.Path)"
 }
 
-# Auto-detect CUDA architecture from nvidia-smi
+# Auto-detect CUDA architecture without nvidia-smi.exe
 function Get-GpuCudaArch {
-    # Check common locations for nvidia-smi.exe
-    $nvsmi_paths = @(
-        (Join-Path ${Env:ProgramFiles} 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'),
-        ($env:CUDA_PATH ? (Join-Path $env:CUDA_PATH 'bin\nvidia-smi.exe') : ''),
-        (Get-Command nvidia-smi -ErrorAction SilentlyContinue)
-    )
+    # Try NVML (driver component) first
+    $nvmlDirs = @(
+        (Join-Path ${Env:ProgramFiles} 'NVIDIA Corporation\NVSMI'),
+        "$env:SystemRoot\System32",
+        "$env:SystemRoot\SysWOW64"
+    ) | Where-Object { Test-Path (Join-Path $_ 'nvml.dll') }
 
-    $nvsmi = $nvsmi_paths | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-    if (-not $nvsmi) { return $null } # can't detect
+    $cs = @"
+using System;
+using System.Runtime.InteropServices;
+public static class NvmlHelper {
+    [DllImport("kernel32.dll", SetLastError = true, CharSet=CharSet.Unicode)]
+    public static extern bool SetDllDirectory(string lpPathName);
 
-    try {
-        # Get compute capability for the first GPU, e.g., "8.6"
-        $computeCap = & $nvsmi --query-gpu=compute_cap --format=csv,noheader | Select-Object -First 1
-        if ([string]::IsNullOrWhiteSpace($computeCap)) { return $null }
+    [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int nvmlInit_v2();
+    [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int nvmlShutdown();
+    [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int nvmlDeviceGetCount_v2(out int count);
+    [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int nvmlDeviceGetHandleByIndex_v2(uint index, out IntPtr device);
+    [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int nvmlDeviceGetCudaComputeCapability(IntPtr device, out int major, out int minor);
 
-        # Convert to integer format, e.g., 86
-        $arch = $computeCap.Trim() -replace '\.', ''
-        return [int]$arch
-    }
-    catch {
-        Write-Warning "Failed to run nvidia-smi to detect CUDA arch: $($_.Exception.Message)"
-        return $null
+    public static int GetMaxSm() {
+        int rc = nvmlInit_v2();
+        if (rc != 0) return -1;
+        try {
+            int count;
+            rc = nvmlDeviceGetCount_v2(out count);
+            if (rc != 0 || count < 1) return -1;
+            int best = -1;
+            for (uint i = 0; i < count; i++) {
+                IntPtr dev;
+                rc = nvmlDeviceGetHandleByIndex_v2(i, out dev);
+                if (rc != 0) continue;
+                int maj, min;
+                rc = nvmlDeviceGetCudaComputeCapability(dev, out maj, out min);
+                if (rc != 0) continue;
+                int sm = maj * 10 + min;
+                if (sm > best) best = sm;
+            }
+            return best;
+        } finally {
+            nvmlShutdown();
+        }
     }
 }
+"@
+
+    # Compile the helper just once
+    try { Add-Type -TypeDefinition $cs -Language CSharp -ErrorAction Stop | Out-Null } catch { }
+
+    foreach ($dir in $nvmlDirs) {
+        try {
+            [NvmlHelper]::SetDllDirectory($dir) | Out-Null
+            $sm = [NvmlHelper]::GetMaxSm()
+            if ($sm -ge 10) { return [int]$sm } # e.g., 86, 89, 75, ...
+        } catch { }
+    }
+
+    # Fallback: heuristic via GPU name (WMI)
+    try {
+        $gpu = Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop |
+                Where-Object { $_.AdapterCompatibility -like '*NVIDIA*' } |
+                Select-Object -First 1
+        if ($gpu) {
+            $name = $gpu.Name
+            $map = @(
+                @{ Re = 'RTX\s*50|Blackwell|GB\d{3}'; SM = 100 } # best guess
+                @{ Re = 'RTX\s*4\d|RTX\s*40|Ada|^AD';        SM = 89 }
+                @{ Re = 'RTX\s*3\d|RTX\s*30|A[4-9]000|A30|A40|^GA|MX[34]50'; SM = 86 }
+                @{ Re = 'RTX\s*2\d|RTX\s*20|Quadro\s*RTX|TITAN\s*RTX|T4|GTX\s*16|TU\d{2}'; SM = 75 }
+                @{ Re = 'GTX\s*10|^GP|P10|P40|TITAN\s*Xp|TITAN\s*X\b';       SM = 61 }
+                @{ Re = 'GTX\s*9|^GM|Tesla\s*M';                             SM = 52 }
+                @{ Re = 'GTX\s*7|GTX\s*8|^GK|Tesla\s*K|K80|GT\s*7';          SM = 35 }
+            )
+            foreach ($m in $map) { if ($name -match $m.Re) { return [int]$m.SM } }
+        }
+    } catch { }
+
+    return $null  # unknown
+}
+
 
 # ---------------------------------------------------------------------------
 # Main routine
@@ -353,33 +476,32 @@ $reqs = @(
 )
 
 # --- Detect GPU and select appropriate CUDA toolkit version ---
-if (-not $PSBoundParameters.ContainsKey('CudaArch')) {
-    $detectedArch = Get-GpuCudaArch
-    if ($detectedArch) {
-        $CudaArch = $detectedArch
-    }
-}
+$DetectedSm = Get-GpuCudaArch
 
 $cudaReq = @{
-    Name = 'CUDA Toolkit'
-    Test = { Test-CUDA }  # default; may be overwritten below
-    Id   = 'Nvidia.CUDA'
+    Name    = 'CUDA Toolkit'
+    Test    = { Test-CUDA }
+    Id      = 'Nvidia.CUDA'
     Version = ''
 }
-
 $PreferCudaVersion = $null
-if ($CudaArch -lt 70) {
-    Write-Host "-> detected older GPU (sm_$CudaArch), selecting CUDA 12.4 for compatibility."
-    $cudaReq.Name    = 'CUDA Toolkit 12.4'
-    $cudaReq.Version = '12.4.1'
-    $cudaReq.Test    = { Test-CUDAExact -MajorMinor '12.4' }   # <<< change here
-    $PreferCudaVersion = [version]'12.4'
+
+if ($DetectedSm) {
+    if ($DetectedSm -lt 70) {
+        Write-Host "-> GPU detected: sm_$DetectedSm (pre-Turing) – selecting CUDA 12.4 for compatibility."
+        $cudaReq.Name    = 'CUDA Toolkit 12.4'
+        $cudaReq.Version = '12.4.1'
+        $cudaReq.Test    = { Test-CUDAExact -MajorMinor '12.4' }
+        $PreferCudaVersion = [version]'12.4'
+    } else {
+        Write-Host "-> GPU detected: sm_$DetectedSm – selecting latest CUDA."
+    }
 } else {
-    Write-Host "-> detected modern GPU (sm_$CudaArch) or no GPU, selecting latest CUDA."
-    $cudaReq.Name = 'CUDA Toolkit >=12.4'
-    $cudaReq.Test = { Test-CUDA }                              # keep generic for latest
+    Write-Host "-> GPU SM could not be determined pre-install – selecting latest CUDA."
 }
+
 $reqs += $cudaReq
+
 
 # --- Install all prerequisites ---
 foreach ($r in $reqs) {
@@ -447,18 +569,6 @@ if ($PreferCudaVersion) {
 # --- Select CUDA toolkit and auto-detect architecture ---
 $cudaRootArg = Use-LatestCuda -Prefer $PreferCudaVersion
 
-if (-not $PSBoundParameters.ContainsKey('CudaArch')) {
-    Write-Host "-> auto-detecting CUDA architecture ..."
-    $detectedArch = Get-GpuCudaArch
-    if ($detectedArch) {
-        $CudaArch = $detectedArch
-        Write-Host ("  detected sm_{0} for your GPU" -f $CudaArch)
-    } else {
-        Write-Host ("  auto-detection failed, using default sm_{0} (GTX 10-series)." -f $CudaArch)
-        Write-Host "  (pass -CudaArch <SM> to override; e.g., 86 for RTX 30-series)"
-    }
-}
-
 # ---------------------------------------------------------------------------
 # Clone & build ggerganov/llama.cpp
 # ---------------------------------------------------------------------------
@@ -477,6 +587,13 @@ if (-not (Test-Path $LlamaRepo)) {
 git -C $LlamaRepo submodule update --init --recursive
 
 # --- configure & build ------------------------------------------------------
+# Prepare CMake CUDA architectures argument
+$CudaArchArg = $DetectedSm ? "$DetectedSm" : 'native'
+if ($DetectedSm) {
+    Write-Host ("-> Using detected compute capability sm_{0}" -f $DetectedSm)
+} else {
+    Write-Host "-> Using CMAKE_CUDA_ARCHITECTURES=native (toolkit will detect during compile)."
+}
 
 New-Item $LlamaBuild -ItemType Directory -Force | Out-Null
 Push-Location $LlamaBuild
@@ -487,7 +604,7 @@ cmake .. -G Ninja `
     -DCMAKE_BUILD_TYPE=Release `
     -DLLAMA_CURL=OFF `
     -DGGML_CUDA_FA_ALL_QUANTS=ON `
-    "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch" `
+    "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchArg" `
     $cudaRootArg
 
 Write-Host '-> building upstream llama.cpp tools (Release) ...'
