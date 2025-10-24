@@ -12,7 +12,7 @@ This project provides a PowerShell script to automate the setup of the `llama.cp
 ## Prerequisites
 
 * Windows 10/11 x64
-* PowerShell 5 or 7
+* PowerShell 7
 * Recent **NVIDIA driver** (no CUDA toolkit required)
 * ~20 GB free disk space
 * **App Installer / winget** available (to install dependencies)

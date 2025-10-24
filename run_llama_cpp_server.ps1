@@ -1,4 +1,4 @@
-﻿<#  run_llama_cpp_server.ps1  PowerShell 5/7
+﻿<#  run_llama_cpp_server.ps1  PowerShell 7
     ----------------------------------------------------------
     • Stores GGUF under .\models\ next to this script
     • Resumable download via BITS, fallback = Invoke-WebRequest
