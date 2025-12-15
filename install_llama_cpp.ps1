@@ -608,7 +608,7 @@ cmake .. -G Ninja `
     $cudaRootArg
 
 Write-Host '-> building upstream llama.cpp tools (Release) ...'
-cmake --build . --config Release --target llama-server llama-batched-bench llama-cli llama-bench --parallel
+cmake --build . --config Release --target llama-server llama-batched-bench llama-cli llama-bench llama-fit-params --parallel
 Pop-Location
 
 Write-Host ''
