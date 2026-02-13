@@ -12,7 +12,8 @@
 
 [CmdletBinding()]
 param(
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [switch]$UseWSL
 )
 
 Set-StrictMode -Version Latest
@@ -329,12 +330,11 @@ function Use-LatestCuda {
     $installs = Get-CudaInstalls | Sort-Object Version -Descending
 
     if ($Prefer) {
-        $pick = $installs | Where-Object {
-            $_.Version.Major -eq $Prefer.Major -and $_.Version.Minor -eq $Prefer.Minor
-        } | Select-Object -First 1
+        # Try to get the latest version that is at least $Prefer
+        $pick = $installs | Where-Object { $_.Version -ge $Prefer } | Select-Object -First 1
         if (-not $pick) {
             $have = ($installs.Version | ForEach-Object { $_.ToString(2) }) -join ', '
-            throw "Requested CUDA $($Prefer.ToString(2)) not found. Installed versions: $have"
+            throw "No CUDA version >= $($Prefer.ToString(2)) found. Installed versions: $have"
         }
     } else {
         $pick = $installs | Where-Object { $_.Version -ge $Min } | Select-Object -First 1
@@ -440,10 +440,83 @@ public static class NvmlHelper {
 
 
 # ---------------------------------------------------------------------------
+# WSL Helper Functions
+# ---------------------------------------------------------------------------
+
+function Get-WslStatus {
+    $list = wsl --list --quiet 2>$null
+    if ($LASTEXITCODE -ne 0) { return "NotInstalled" }
+    if ($list -contains "Ubuntu") { return "UbuntuReady" }
+    return "WslInstalledNoDistro"
+}
+
+function Setup-WSL {
+    $status = Get-WslStatus
+    if ($status -eq "NotInstalled") {
+        Write-Host "-> WSL is not installed. Enabling Windows features..." -ForegroundColor Yellow
+        Write-Host "   (This uses 'wsl --install' and may trigger Windows Update/Feature enablement. This can take several minutes.)" -ForegroundColor Gray
+        
+        # Use Start-Process to ensure we don't block the host output streams in a way that hides progress
+        $p = Start-Process wsl.exe -ArgumentList "--install", "--no-launch" -NoNewWindow -Wait -PassThru
+        
+        if ($p.ExitCode -eq 0) {
+            Write-Host "****************************************************************" -ForegroundColor Cyan
+            Write-Host "WSL installation successful! A REBOOT IS REQUIRED to continue."   -ForegroundColor Cyan
+            Write-Host "After rebooting, Ubuntu will finish installing automatically."  -ForegroundColor Cyan
+            Write-Host "Then, please run this script again with -UseWSL."               -ForegroundColor Cyan
+            Write-Host "****************************************************************" -ForegroundColor Cyan
+        } else {
+            Write-Error "WSL installation failed with exit code $($p.ExitCode)."
+        }
+        exit 0
+    }
+
+    if ($status -eq "WslInstalledNoDistro") {
+        Write-Host "-> WSL is active. Installing Ubuntu distribution..." -ForegroundColor Yellow
+        Write-Progress -Activity "WSL Setup" -Status "Installing Ubuntu..." -PercentComplete 25
+        wsl --install -d Ubuntu
+        Start-Sleep -Seconds 5
+    }
+
+    Write-Host "-> Preparing WSL environment (Ubuntu)..." -ForegroundColor Cyan
+    Write-Progress -Activity "WSL Setup" -Status "Updating and installing dependencies..." -PercentComplete 40
+    
+    # We'll run the setup in chunks so the user sees progress on the host
+    $cmds = @(
+        @{ Msg = "Updating package lists..."; Cmd = "sudo apt-get update" },
+        @{ Msg = "Installing build tools...";  Cmd = "sudo apt-get install -y build-essential cmake git wget libcurl4-openssl-dev" },
+        @{ Msg = "Checking for CUDA...";       Cmd = "if ! command -v nvcc &> /dev/null; then echo 'Installing CUDA...'; wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb && sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt-get update && sudo apt-get -y install cuda-toolkit-12-4 && rm cuda-keyring_1.1-1_all.deb; fi" },
+        @{ Msg = "Cloning/Updating llama.cpp..."; Cmd = "mkdir -p ~/llama.cpp-build && cd ~/llama.cpp-build && (if [ ! -d 'llama.cpp' ]; then git clone https://github.com/ggerganov/llama.cpp.git; else cd llama.cpp && git pull; fi)" },
+        @{ Msg = "Building llama.cpp (this takes time)..."; Cmd = "cd ~/llama.cpp-build/llama.cpp && mkdir -p build && cd build && cmake .. -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release && cmake --build . --config Release --target llama-server llama-bench -j$(nproc)" }
+    )
+
+    $step = 0
+    foreach ($c in $cmds) {
+        $step++
+        $pct = 40 + ($step * 10)
+        Write-Host "   [$step/$($cmds.Count)] $($c.Msg)" -ForegroundColor Gray
+        Write-Progress -Activity "WSL Setup" -Status $c.Msg -PercentComplete $pct
+        
+        # Run command via WSL. We use -u root for apt commands if needed, but here we assume 'sudo' works
+        # or we just run the whole thing as the default user which has sudo rights.
+        wsl -d Ubuntu -e bash -c "export DEBIAN_FRONTEND=noninteractive; $($c.Cmd)"
+    }
+
+    Write-Progress -Activity "WSL Setup" -Completed
+    Write-Host "[OK] WSL setup and build finished." -ForegroundColor Green
+    Write-Host "Binaries are located inside WSL at: ~/llama.cpp-build/llama.cpp/build/bin/" -ForegroundColor Gray
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
 # Main routine
 # ---------------------------------------------------------------------------
 
 Assert-Admin
+
+if ($UseWSL) {
+    Setup-WSL
+}
 
 # --- Base prerequisites (excluding CUDA, which is handled dynamically) ---
 $reqs = @(
@@ -493,6 +566,11 @@ if ($DetectedSm) {
         $cudaReq.Version = '12.4.1'
         $cudaReq.Test    = { Test-CUDAExact -MajorMinor '12.4' }
         $PreferCudaVersion = [version]'12.4'
+    } elseif ($DetectedSm -ge 100) {
+        Write-Host "-> GPU detected: sm_$DetectedSm (Blackwell) – selecting CUDA 12.8+ for optimal performance."
+        $cudaReq.Name    = 'CUDA Toolkit 12.8'
+        $cudaReq.Version = '12.8.0'
+        $PreferCudaVersion = [version]'12.8'
     } else {
         Write-Host "-> GPU detected: sm_$DetectedSm – selecting latest CUDA."
     }
@@ -557,12 +635,12 @@ Import-VSEnv   # make cl.exe etc. available in this session
 if ($SkipBuild) { Write-Host 'SkipBuild set – done.'; return }
 
 if ($PreferCudaVersion) {
-    $hasExact = Get-CudaInstalls | Where-Object {
-        $_.Version.Major -eq $PreferCudaVersion.Major -and $_.Version.Minor -eq $PreferCudaVersion.Minor
+    $hasCompatible = Get-CudaInstalls | Where-Object {
+        $_.Version -ge $PreferCudaVersion
     } | Select-Object -First 1
-    if (-not $hasExact) {
+    if (-not $hasCompatible) {
         $have = ((Get-CudaInstalls).Version | ForEach-Object { $_.ToString(2) }) -join ', '
-        throw "CUDA $($PreferCudaVersion.ToString(2)) did not get installed. Installed versions: $have"
+        throw "CUDA $($PreferCudaVersion.ToString(2)) or newer did not get installed. Installed versions: $have"
     }
 }
 
@@ -600,7 +678,13 @@ Push-Location $LlamaBuild
 
 Write-Host '-> generating upstream llama.cpp solution ...'
 cmake .. -G Ninja `
-    -DGGML_CUDA=ON -DGGML_CUBLAS=ON `
+    -DGGML_CUDA=ON `
+    -DGGML_NATIVE=ON `
+    -DGGML_AVX512=ON `
+    -DGGML_AVX512_VNNI=ON `
+    -DGGML_AVX512_BF16=ON `
+    -DGGML_AVX512_VBMI=ON `
+    -DGGML_AVX512_VPOPCNTDQ=ON `
     -DCMAKE_BUILD_TYPE=Release `
     -DLLAMA_CURL=OFF `
     -DGGML_CUDA_FA_ALL_QUANTS=ON `
