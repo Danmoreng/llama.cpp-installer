@@ -444,10 +444,31 @@ public static class NvmlHelper {
 # ---------------------------------------------------------------------------
 
 function Get-WslStatus {
+    if (-not (Test-Command wsl.exe)) { return "NotInstalled" }
+
     $list = wsl --list --quiet 2>$null
-    if ($LASTEXITCODE -ne 0) { return "NotInstalled" }
-    if ($list -contains "Ubuntu") { return "UbuntuReady" }
+    if ($LASTEXITCODE -ne 0) {
+        # If wsl --list fails, it might be not installed or just no distros
+        $err = wsl --list 2>&1
+        if ($err -match "no installed distributions" -or $err -match "keine installierten Distributionen") {
+            return "WslInstalledNoDistro"
+        }
+        return "NotInstalled"
+    }
+    if ($null -eq $list -or $list.Count -eq 0) {
+        return "WslInstalledNoDistro"
+    }
+    # Clean up null bytes/encoding issues that often plague wsl --quiet
+    $cleanList = $list | ForEach-Object { $_ -replace "`0", "" } | Where-Object { $_.Trim() -ne "" }
+    if ($cleanList -contains "Ubuntu") { return "UbuntuReady" }
     return "WslInstalledNoDistro"
+}
+
+function Test-WslDistroReady {
+    param([string]$Distro = "Ubuntu")
+    $out = & wsl.exe -d $Distro -e bash -lc "true" 2>&1
+    if ($LASTEXITCODE -eq 0) { return $true }
+    return $false
 }
 
 function Setup-WSL {
@@ -474,8 +495,40 @@ function Setup-WSL {
     if ($status -eq "WslInstalledNoDistro") {
         Write-Host "-> WSL is active. Installing Ubuntu distribution..." -ForegroundColor Yellow
         Write-Progress -Activity "WSL Setup" -Status "Installing Ubuntu..." -PercentComplete 25
-        wsl --install -d Ubuntu
-        Start-Sleep -Seconds 5
+        
+        $p = Start-Process wsl.exe -ArgumentList "--install", "-d", "Ubuntu", "--no-launch" -NoNewWindow -Wait -PassThru
+        if ($p.ExitCode -ne 0) {
+            throw "Failed to install Ubuntu distribution (Exit code $($p.ExitCode))."
+        }
+
+        Write-Host "   Waiting for Ubuntu to register (up to 60s)..." -ForegroundColor Gray
+        $timeout = [Diagnostics.Stopwatch]::StartNew()
+        $found = $false
+        while ($timeout.Elapsed.TotalSeconds -lt 60) {
+            # Check list with and without null-cleansing
+            $list = wsl --list --quiet 2>$null | ForEach-Object { $_ -replace "`0", "" }
+            if ($list -match "Ubuntu") {
+                $found = $true
+                break
+            }
+            Write-Host "." -NoNewline
+            Start-Sleep -Seconds 3
+        }
+        Write-Host ""
+
+        if (-not $found) {
+            Write-Warning "Ubuntu was installed but is not showing in 'wsl --list'."
+            Write-Warning "Please open a new terminal and run 'wsl --install -d Ubuntu' manually to finish the setup (username/password)."
+            Write-Warning "Then run this script again."
+            exit 1
+        }
+    }
+
+    if (-not (Test-WslDistroReady -Distro "Ubuntu")) {
+        Write-Warning "Ubuntu is installed but not initialized yet."
+        Write-Warning "Please run 'wsl -d Ubuntu' once to create a Linux user/password."
+        Write-Warning "After that completes, re-run this script with -UseWSL."
+        exit 1
     }
 
     Write-Host "-> Preparing WSL environment (Ubuntu)..." -ForegroundColor Cyan
@@ -487,7 +540,7 @@ function Setup-WSL {
         @{ Msg = "Installing build tools...";  Cmd = "sudo apt-get install -y build-essential cmake git wget libcurl4-openssl-dev" },
         @{ Msg = "Checking for CUDA...";       Cmd = "if ! command -v nvcc &> /dev/null; then echo 'Installing CUDA...'; wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb && sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt-get update && sudo apt-get -y install cuda-toolkit-12-4 && rm cuda-keyring_1.1-1_all.deb; fi" },
         @{ Msg = "Cloning/Updating llama.cpp..."; Cmd = "mkdir -p ~/llama.cpp-build && cd ~/llama.cpp-build && (if [ ! -d 'llama.cpp' ]; then git clone https://github.com/ggerganov/llama.cpp.git; else cd llama.cpp && git pull; fi)" },
-        @{ Msg = "Building llama.cpp (this takes time)..."; Cmd = "cd ~/llama.cpp-build/llama.cpp && mkdir -p build && cd build && cmake .. -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release && cmake --build . --config Release --target llama-server llama-bench -j$(nproc)" }
+        @{ Msg = "Building llama.cpp (this takes time)..."; Cmd = "cd ~/llama.cpp-build/llama.cpp && mkdir -p build && cd build && cmake .. -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release && cmake --build . --config Release --target llama-server llama-bench -j`$(nproc)" }
     )
 
     $step = 0
@@ -497,9 +550,12 @@ function Setup-WSL {
         Write-Host "   [$step/$($cmds.Count)] $($c.Msg)" -ForegroundColor Gray
         Write-Progress -Activity "WSL Setup" -Status $c.Msg -PercentComplete $pct
         
-        # Run command via WSL. We use -u root for apt commands if needed, but here we assume 'sudo' works
-        # or we just run the whole thing as the default user which has sudo rights.
-        wsl -d Ubuntu -e bash -c "export DEBIAN_FRONTEND=noninteractive; $($c.Cmd)"
+        # Run command via WSL.
+        wsl -d Ubuntu -e bash -lc "export DEBIAN_FRONTEND=noninteractive; $($c.Cmd)"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "WSL command failed: $($c.Msg)"
+            exit 1
+        }
     }
 
     Write-Progress -Activity "WSL Setup" -Completed
