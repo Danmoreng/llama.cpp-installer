@@ -72,13 +72,20 @@ $Args = @(
     '--no-mmap',
     '--threads', $threads,
 
+    # Optimized batching for consumer GPUs
+    '-b', '1024',
+    '-ub', '256',
+
+    # KV-cache quantization (VRAM efficiency for large contexts)
+    '-ctk', 'q8_0',
+    '-ctv', 'q8_0',
+
     # Router mode: do NOT pass --model
     '--models-dir',   $ModelDir,   # discover GGUFs from .\models
 
-    # Automatic parameter fitting (on by default in recent llama.cpp)
-    # These tune GPU layers / tensor split / tensor overrides, and
-    # can shrink context until it fits in VRAM.
-    '--fit-target',   '512',      # MiB of free VRAM to leave per GPU (tweak if you like)
+    # Automatic parameter fitting (optimizes layer offloading)
+    '--fit',          'on',
+    '--fit-target',   '256',       # MiB of free VRAM to leave per GPU
     '--fit-ctx',      '32768'      # minimum context size auto-fit is allowed to shrink to
 )
 

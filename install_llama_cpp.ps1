@@ -302,7 +302,25 @@ function Refresh-Env {
     foreach ($k in $user.Keys)    { Set-Item -Path "Env:$k" -Value $user[$k] }
 
     # Re-compose PATH explicitly (User appended to Machine by convention)
-    $env:Path = "$([Environment]::GetEnvironmentVariable('Path','Machine'));$([Environment]::GetEnvironmentVariable('Path','User'))"
+    $rawPath = "$([Environment]::GetEnvironmentVariable('Path','Machine'));$([Environment]::GetEnvironmentVariable('Path','User'))"
+
+    # Filter out MSYS2/Cygwin paths which conflict with MSVC builds
+    $parts = $rawPath -split ';' | Where-Object {
+        $_ -and $_ -notmatch 'msys64|mingw64|ucrt64|cygwin'
+    }
+    $env:Path = $parts -join ';'
+
+    # Try to discover native OpenSSL
+    $sslRoots = @(
+        'C:\Program Files\OpenSSL-Win64',
+        'C:\Program Files\OpenSSL'
+    )
+    foreach ($r in $sslRoots) {
+        if (Test-Path (Join-Path $r 'include\openssl\ssl.h')) {
+            $env:OPENSSL_ROOT_DIR = $r
+            break
+        }
+    }
 }
 
 function Ensure-CommandAvailable([string]$Cmd, [int]$TimeoutMin = 5) {
@@ -482,8 +500,9 @@ function Reset-CMakeCacheIfCudaChanged {
     $expectedNvcc = (Join-Path $CudaRoot 'bin\nvcc.exe').Replace('\', '/')
     $configuredForRoot = $cacheText -match [regex]::Escape($expectedRoot)
     $configuredForNvcc = $cacheText -match [regex]::Escape($expectedNvcc)
+    $configuredWithOpenSSL = $cacheText -match 'LLAMA_OPENSSL:BOOL=ON'
 
-    if ($configuredForRoot -or $configuredForNvcc) { return }
+    if ($configuredForRoot -and $configuredForNvcc -and -not $configuredWithOpenSSL) { return }
 
     $resolvedBuildDir = (Resolve-Path -LiteralPath $BuildDir).Path
     $resolvedRepoRoot = (Resolve-Path -LiteralPath (Join-Path $ScriptRoot 'vendor\llama.cpp')).Path
@@ -652,6 +671,12 @@ $reqs = @(
         Test          = { Test-Command ninja }
         Id            = 'Ninja-build.Ninja'
         Cmd           = 'ninja'
+    },
+    @{
+        Name          = 'OpenSSL'
+        Test          = { $env:OPENSSL_ROOT_DIR -ne $null -and (Test-Path $env:OPENSSL_ROOT_DIR) -and (Test-Path (Join-Path $env:OPENSSL_ROOT_DIR 'include\openssl\ssl.h')) }
+        Id            = 'ShiningLight.OpenSSL.Dev'
+        # Custom install logic below
     }
 )
 
@@ -813,6 +838,8 @@ try {
         -DGGML_CUDA=ON -DGGML_CUBLAS=ON `
         -DCMAKE_BUILD_TYPE=Release `
         -DLLAMA_CURL=OFF `
+        -DLLAMA_OPENSSL=ON `
+        "-DOPENSSL_ROOT_DIR=$env:OPENSSL_ROOT_DIR" `
         -DGGML_CUDA_FA_ALL_QUANTS=ON `
         "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchArg" `
         $cudaRootArg
