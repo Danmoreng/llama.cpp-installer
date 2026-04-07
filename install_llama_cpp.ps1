@@ -315,6 +315,7 @@ function Refresh-Env {
         'C:\Program Files\OpenSSL-Win64',
         'C:\Program Files\OpenSSL'
     )
+    $env:OPENSSL_ROOT_DIR = $null
     foreach ($r in $sslRoots) {
         if (Test-Path (Join-Path $r 'include\openssl\ssl.h')) {
             $env:OPENSSL_ROOT_DIR = $r
@@ -500,9 +501,8 @@ function Reset-CMakeCacheIfCudaChanged {
     $expectedNvcc = (Join-Path $CudaRoot 'bin\nvcc.exe').Replace('\', '/')
     $configuredForRoot = $cacheText -match [regex]::Escape($expectedRoot)
     $configuredForNvcc = $cacheText -match [regex]::Escape($expectedNvcc)
-    $configuredWithOpenSSL = $cacheText -match 'LLAMA_OPENSSL:BOOL=ON'
 
-    if ($configuredForRoot -and $configuredForNvcc -and -not $configuredWithOpenSSL) { return }
+    if ($configuredForRoot -and $configuredForNvcc) { return }
 
     $resolvedBuildDir = (Resolve-Path -LiteralPath $BuildDir).Path
     $resolvedRepoRoot = (Resolve-Path -LiteralPath (Join-Path $ScriptRoot 'vendor\llama.cpp')).Path
@@ -671,12 +671,6 @@ $reqs = @(
         Test          = { Test-Command ninja }
         Id            = 'Ninja-build.Ninja'
         Cmd           = 'ninja'
-    },
-    @{
-        Name          = 'OpenSSL'
-        Test          = { $env:OPENSSL_ROOT_DIR -ne $null -and (Test-Path $env:OPENSSL_ROOT_DIR) -and (Test-Path (Join-Path $env:OPENSSL_ROOT_DIR 'include\openssl\ssl.h')) }
-        Id            = 'ShiningLight.OpenSSL.Dev'
-        # Custom install logic below
     }
 )
 
@@ -827,6 +821,7 @@ if ($DetectedSm) {
     Write-Host "-> Using CMAKE_CUDA_ARCHITECTURES=native (toolkit will detect during compile)."
 }
 
+Refresh-Env
 New-Item $LlamaBuild -ItemType Directory -Force | Out-Null
 Reset-CMakeCacheIfCudaChanged -BuildDir $LlamaBuild -CudaRoot $env:CUDA_PATH
 Import-VSEnv   # make cl.exe etc. available in this session after any env refreshes/install steps
@@ -834,15 +829,32 @@ Push-Location $LlamaBuild
 
 try {
     Write-Host '-> generating upstream llama.cpp solution ...'
-    cmake .. -G Ninja `
-        -DGGML_CUDA=ON -DGGML_CUBLAS=ON `
-        -DCMAKE_BUILD_TYPE=Release `
-        -DLLAMA_CURL=OFF `
-        -DLLAMA_OPENSSL=ON `
-        "-DOPENSSL_ROOT_DIR=$env:OPENSSL_ROOT_DIR" `
-        -DGGML_CUDA_FA_ALL_QUANTS=ON `
-        "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchArg" `
-        $cudaRootArg
+    $cmakeArgs = @(
+        '..', '-G', 'Ninja',
+        '-DGGML_CUDA=ON', '-DGGML_CUBLAS=ON',
+        '-DCMAKE_BUILD_TYPE=Release',
+        '-DLLAMA_CURL=OFF',
+        '-DGGML_CUDA_FA_ALL_QUANTS=ON',
+        "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchArg"
+    )
+    if ($cudaRootArg) {
+        $cmakeArgs += $cudaRootArg
+    }
+
+    $hasNativeOpenSSL = $env:OPENSSL_ROOT_DIR -and `
+        (Test-Path $env:OPENSSL_ROOT_DIR) -and `
+        (Test-Path (Join-Path $env:OPENSSL_ROOT_DIR 'include\openssl\ssl.h'))
+
+    if ($hasNativeOpenSSL) {
+        Write-Host ("-> Native OpenSSL detected at {0}; enabling HTTPS support." -f $env:OPENSSL_ROOT_DIR)
+        $cmakeArgs += '-DLLAMA_OPENSSL=ON'
+        $cmakeArgs += "-DOPENSSL_ROOT_DIR=$env:OPENSSL_ROOT_DIR"
+    } else {
+        Write-Host "-> Native OpenSSL not detected; disabling HTTPS support for this build."
+        $cmakeArgs += '-DLLAMA_OPENSSL=OFF'
+    }
+
+    cmake @cmakeArgs
     Assert-LastExitCode "cmake configure"
 
     Write-Host '-> building upstream llama.cpp tools (Release) ...'
