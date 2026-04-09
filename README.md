@@ -2,6 +2,8 @@
 
 This project provides a PowerShell script to automate the setup of the `llama.cpp` development environment on Windows. It installs all required prerequisites **silently**, selects an appropriate **CUDA Toolkit** version, and builds `llama.cpp` from source.
 
+Temporary CUDA policy for this repo: CUDA `13.2` is excluded due to corrupt `llama.cpp` builds. The scripts currently cap automatic selection at CUDA `13.1` unless you explicitly pin another compatible version.
+
 ## Prerequisites
 
 * Windows 10/11 x64
@@ -26,7 +28,7 @@ This project provides a PowerShell script to automate the setup of the `llama.cp
 
    * Detects your GPU’s **SM** via NVML.
    * **SM < 70 (pre-Turing)** → installs/uses **CUDA 12.4**.
-   * **SM ≥ 70** or unknown → uses the newest compatible installed CUDA (≥ 12.4).
+   * **SM ≥ 70** or unknown → uses the newest compatible installed CUDA (≥ 12.4, currently capped at 13.1).
    * If `winget` reports a newer compatible CUDA toolkit, the script prompts whether to upgrade or keep the current install.
 4. **Clones and builds `llama.cpp`** under `vendor\llama.cpp`.
 
@@ -42,6 +44,19 @@ Set-ExecutionPolicy Bypass -Scope Process
 ./install_llama_cpp.ps1
 ```
 
+Explicit CUDA version controls:
+
+```powershell
+# Keep the repo on CUDA 13.1 for now
+./install_llama_cpp.ps1 -PinnedCudaVersion 13.1
+
+# Or force CUDA 13.0 specifically
+./install_llama_cpp.ps1 -PinnedCudaVersion 13.0
+
+# Or allow any compatible version up to 13.0
+./install_llama_cpp.ps1 -MaxCudaVersion 13.0
+```
+
 Optional: skip the build step (installs prerequisites + CUDA only):
 
 ```powershell
@@ -52,6 +67,16 @@ The built binaries will be in:
 
 ```
 vendor\llama.cpp\build\bin
+```
+
+If you already have `llama.cpp` installed and just want to rebuild against a safe toolkit:
+
+```powershell
+./rebuild_llama_cpp.ps1
+
+# Or pin the rebuild to a specific installed toolkit
+./rebuild_llama_cpp.ps1 -PinnedCudaVersion 13.1
+./rebuild_llama_cpp.ps1 -PinnedCudaVersion 13.0
 ```
 
 ## Uninstallation
@@ -87,7 +112,7 @@ To run the server, use the following command in PowerShell:
 
 * **winget not found**: Install “App Installer” from the Microsoft Store, then re-run.
 * **Pending reboot**: Some installs require a reboot (Windows Update/VS Installer). Reboot and re-run.
-* **CUDA side-by-side**: Multiple CUDA toolkits can co-exist; the uninstaller can remove them via winget.
+* **CUDA side-by-side**: Multiple CUDA toolkits can co-exist. You do not need to uninstall CUDA 13.2 if CUDA 13.1 or 13.0 is also installed; the scripts will select the pinned/capped version.
 * **NVML missing**: The script falls back to a heuristic and then `CMAKE_CUDA_ARCHITECTURES=native`.
 * **Locked files**: Stop `llama-server`/`llama-cli` before uninstalling.
 

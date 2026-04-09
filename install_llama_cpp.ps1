@@ -12,7 +12,9 @@
 
 [CmdletBinding()]
 param(
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [version]$PinnedCudaVersion,
+    [version]$MaxCudaVersion = [version]'13.1'
 )
 
 Set-StrictMode -Version Latest
@@ -133,6 +135,16 @@ function Test-CUDA {
     return ($installs | Where-Object { $_.Version -ge $min } | Select-Object -First 1) -ne $null
 }
 
+function Test-CompatibleCudaInstalled {
+    param(
+        [version]$Min = [version]'12.4',
+        [version]$Max = $null,
+        [version]$Pinned = $null
+    )
+
+    (Get-CompatibleCudaInstalls -Min $Min -Max $Max -Pinned $Pinned | Select-Object -First 1) -ne $null
+}
+
 function Test-CUDAExact {
     param([Parameter(Mandatory=$true)][string]$MajorMinor) # e.g. '12.4'
     $target = [version]("$MajorMinor")
@@ -213,6 +225,36 @@ function Get-LatestCompatibleInstallableCudaVersion {
         Select-Object -First 1
 }
 
+function Get-HigherInstalledCudaVersion {
+    param([Parameter(Mandatory = $true)][version]$TargetVersion)
+
+    $targetKey = Get-CudaVersionKey -Version $TargetVersion
+
+    Get-CudaInstalls |
+        Where-Object { (Get-CudaVersionKey -Version $_.Version) -gt $targetKey } |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+}
+
+function Get-CudaVersionLabel {
+    param([version]$Version)
+
+    if ($Version) { return $Version.ToString(2) }
+    return 'none'
+}
+
+function Test-WingetCudaSidegradeBlocked {
+    param([Parameter(Mandatory = $true)][version]$TargetVersion)
+
+    $targetKey = Get-CudaVersionKey -Version $TargetVersion
+    $exactInstall = Get-CudaInstalls | Where-Object {
+        (Get-CudaVersionKey -Version $_.Version) -eq $targetKey
+    } | Select-Object -First 1
+
+    if ($exactInstall) { return $false }
+    return $null -ne (Get-HigherInstalledCudaVersion -TargetVersion $TargetVersion)
+}
+
 function Should-InstallNewerCuda {
     param(
         [Parameter(Mandatory = $true)][version]$InstalledVersion,
@@ -223,6 +265,12 @@ function Should-InstallNewerCuda {
     $availableKey = Get-CudaVersionKey -Version $AvailableVersion
 
     if ($availableKey -le $installedKey) { return $false }
+
+    $blockingHigherCuda = Get-HigherInstalledCudaVersion -TargetVersion $AvailableVersion
+    if ($blockingHigherCuda) {
+        Write-Warning ("CUDA {0} is installable, but CUDA {1} is already present. winget will not install the older Nvidia.CUDA package side-by-side, so keeping CUDA {2}. To move to CUDA {0}, remove 'NVIDIA CUDA Toolkit {1}' first or install CUDA {0} manually from NVIDIA's archive." -f $AvailableVersion.ToString(2), $blockingHigherCuda.Version.ToString(2), $InstalledVersion.ToString(2))
+        return $false
+    }
 
     try {
         Write-Host ""
@@ -241,6 +289,11 @@ function Install-CudaToolkitVersion {
 
     $versionText = $Version.ToString()
     $versionKey = Get-CudaVersionKey -Version $Version
+
+    if (Test-WingetCudaSidegradeBlocked -TargetVersion $Version) {
+        $higher = Get-HigherInstalledCudaVersion -TargetVersion $Version
+        throw "Cannot install CUDA $versionText while CUDA $($higher.Version.ToString(2)) is already installed via the Nvidia.CUDA package. winget treats this as a downgrade and does not install the older toolkit side-by-side. Remove 'NVIDIA CUDA Toolkit $($higher.Version.ToString(2))' first, or install CUDA $versionText manually from NVIDIA's archive."
+    }
 
     if ($versionKey -eq [version]'12.4') {
         try {
@@ -679,23 +732,26 @@ $DetectedSm = Get-GpuCudaArch
 
 $cudaReq = @{
     Name    = 'CUDA Toolkit'
-    Test    = { Test-CUDA }
+    Test    = { Test-CompatibleCudaInstalled -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $EffectivePinnedCudaVersion }
     Id      = 'Nvidia.CUDA'
     Version = ''
 }
 $RequiredCudaVersion = [version]'12.4'
-$MaxCompatibleCudaVersion = $null
-$PinnedCudaVersion = $null
+$MaxCompatibleCudaVersion = $MaxCudaVersion
+$EffectivePinnedCudaVersion = $PinnedCudaVersion
 
 if ($DetectedSm) {
     if ($DetectedSm -lt 70) {
+        if ($PinnedCudaVersion -and (Get-CudaVersionKey -Version $PinnedCudaVersion) -ne [version]'12.4') {
+            throw "Detected sm_$DetectedSm requires CUDA 12.4 for compatibility. Requested pinned CUDA version: $($PinnedCudaVersion.ToString(2))."
+        }
         Write-Host "-> GPU detected: sm_$DetectedSm (pre-Turing) – selecting CUDA 12.4 for compatibility."
         $cudaReq.Name    = 'CUDA Toolkit 12.4'
         $cudaReq.Version = '12.4.1'
         $cudaReq.Test    = { Test-CUDAExact -MajorMinor '12.4' }
         $RequiredCudaVersion = [version]'12.4'
         $MaxCompatibleCudaVersion = [version]'12.4'
-        $PinnedCudaVersion = [version]'12.4'
+        $EffectivePinnedCudaVersion = [version]'12.4'
     } elseif ($DetectedSm -ge 100) {
         Write-Host "-> GPU detected: sm_$DetectedSm (Blackwell) – selecting CUDA 12.8+ for optimal performance."
         $cudaReq.Name    = 'CUDA Toolkit 12.8'
@@ -708,9 +764,31 @@ if ($DetectedSm) {
     Write-Host "-> GPU SM could not be determined pre-install – selecting latest CUDA."
 }
 
+if ($MaxCompatibleCudaVersion) {
+    $requiredKey = Get-CudaVersionKey -Version $RequiredCudaVersion
+    $maxKey = Get-CudaVersionKey -Version $MaxCompatibleCudaVersion
+    if ($maxKey -lt $requiredKey) {
+        throw "Configured MaxCudaVersion $($MaxCompatibleCudaVersion.ToString(2)) is below the required CUDA version $($RequiredCudaVersion.ToString(2))."
+    }
+}
+
+if ($EffectivePinnedCudaVersion) {
+    $requiredKey = Get-CudaVersionKey -Version $RequiredCudaVersion
+    $pinnedKey = Get-CudaVersionKey -Version $EffectivePinnedCudaVersion
+    if ($pinnedKey -lt $requiredKey) {
+        throw "Configured PinnedCudaVersion $($EffectivePinnedCudaVersion.ToString(2)) is below the required CUDA version $($RequiredCudaVersion.ToString(2))."
+    }
+}
+
+if ($EffectivePinnedCudaVersion) {
+    Write-Host ("-> CUDA pin active: {0}" -f $EffectivePinnedCudaVersion.ToString(2)) -ForegroundColor Cyan
+} elseif ($MaxCompatibleCudaVersion) {
+    Write-Host ("-> CUDA cap active: using/installing at most CUDA {0}" -f $MaxCompatibleCudaVersion.ToString(2)) -ForegroundColor Cyan
+}
+
 $reqs += $cudaReq
 
-$HadCompatibleCudaBeforeInstall = (Get-CompatibleCudaInstalls -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $PinnedCudaVersion | Select-Object -First 1) -ne $null
+$HadCompatibleCudaBeforeInstall = (Get-CompatibleCudaInstalls -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $EffectivePinnedCudaVersion | Select-Object -First 1) -ne $null
 
 
 # --- Install all prerequisites ---
@@ -738,12 +816,20 @@ foreach ($r in $reqs) {
             default {
                 $installerArgs = $r.ContainsKey('InstallerArgs') ? $r['InstallerArgs'] : ''
                 $version = $r.ContainsKey('Version')       ? $r['Version']       : ''
-                Install-Winget -Id $r.Id -InstallerArgs $installerArgs -Version $version
-                if ($r.Name -ne 'Ninja') {
-                    if ($r.ContainsKey('Cmd') -and $r['Cmd']) {
-                        Ensure-CommandAvailable -Cmd $r['Cmd'] -TimeoutMin 5
-                    } else {
-                        Refresh-Env
+                if ($r.Id -eq 'Nvidia.CUDA' -and [string]::IsNullOrWhiteSpace($version)) {
+                    $targetCuda = Get-LatestCompatibleInstallableCudaVersion -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $EffectivePinnedCudaVersion
+                    if (-not $targetCuda) {
+                        throw "No compatible CUDA toolkit is currently installable for the configured range. Required: >= $($RequiredCudaVersion.ToString(2)); Max: $(Get-CudaVersionLabel -Version $MaxCompatibleCudaVersion); Pinned: $(Get-CudaVersionLabel -Version $EffectivePinnedCudaVersion)."
+                    }
+                    Install-CudaToolkitVersion -Version $targetCuda
+                } else {
+                    Install-Winget -Id $r.Id -InstallerArgs $installerArgs -Version $version
+                    if ($r.Name -ne 'Ninja') {
+                        if ($r.ContainsKey('Cmd') -and $r['Cmd']) {
+                            Ensure-CommandAvailable -Cmd $r['Cmd'] -TimeoutMin 5
+                        } else {
+                            Refresh-Env
+                        }
                     }
                 }
             }
@@ -765,8 +851,8 @@ if (-not (Test-Command ninja)) {
 if ($SkipBuild) { Write-Host 'SkipBuild set – done.'; return }
 
 if ($HadCompatibleCudaBeforeInstall) {
-    $installedCuda = Get-CompatibleCudaInstalls -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $PinnedCudaVersion | Select-Object -First 1
-    $availableCuda = Get-LatestCompatibleInstallableCudaVersion -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $PinnedCudaVersion
+    $installedCuda = Get-CompatibleCudaInstalls -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $EffectivePinnedCudaVersion | Select-Object -First 1
+    $availableCuda = Get-LatestCompatibleInstallableCudaVersion -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $EffectivePinnedCudaVersion
 
     if ($installedCuda -and $availableCuda) {
         if (Should-InstallNewerCuda -InstalledVersion $installedCuda.Version -AvailableVersion $availableCuda) {
@@ -778,10 +864,12 @@ if ($HadCompatibleCudaBeforeInstall) {
     }
 }
 
-$hasCompatible = Get-CompatibleCudaInstalls -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $PinnedCudaVersion | Select-Object -First 1
+$hasCompatible = Get-CompatibleCudaInstalls -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $EffectivePinnedCudaVersion | Select-Object -First 1
 if (-not $hasCompatible) {
-    $expected = if ($PinnedCudaVersion) {
-        $PinnedCudaVersion.ToString(2)
+    $expected = if ($EffectivePinnedCudaVersion) {
+        $EffectivePinnedCudaVersion.ToString(2)
+    } elseif ($MaxCompatibleCudaVersion) {
+        "$($RequiredCudaVersion.ToString(2)) through $($MaxCompatibleCudaVersion.ToString(2))"
     } else {
         "$($RequiredCudaVersion.ToString(2)) or newer"
     }
@@ -790,7 +878,7 @@ if (-not $hasCompatible) {
 }
 
 # --- Select CUDA toolkit and auto-detect architecture ---
-$cudaRootArg = Use-LatestCuda -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $PinnedCudaVersion
+$cudaRootArg = Use-LatestCuda -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $EffectivePinnedCudaVersion
 
 # ---------------------------------------------------------------------------
 # Clone & build ggerganov/llama.cpp
