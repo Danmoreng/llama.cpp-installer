@@ -1,6 +1,13 @@
 # llama.cpp Installer for Windows
 
-This project provides a PowerShell script to automate the setup of the `llama.cpp` development environment on Windows. It installs all required prerequisites **silently**, selects an appropriate **CUDA Toolkit** version, and builds `llama.cpp` from source.
+This project provides PowerShell scripts to automate the setup of the `llama.cpp` development environment on Windows. It installs the required prerequisites **silently**, selects an appropriate compute backend, and builds `llama.cpp` from source.
+
+The repo is still **Windows-only** today. What changed is backend support: it is no longer implicitly NVIDIA-only.
+
+* `auto` chooses `cuda` on NVIDIA GPUs, `vulkan` on AMD or Intel GPUs, and `cpu` if no supported GPU is detected.
+* `cuda` keeps the existing NVIDIA-focused flow.
+* `vulkan` is the recommended Windows path for AMD and Intel GPUs.
+* `cpu` builds a plain CPU-only binary.
 
 Temporary CUDA policy for this repo: CUDA `13.2` is excluded due to corrupt `llama.cpp` builds. The scripts currently cap automatic selection at CUDA `13.1` unless you explicitly pin another compatible version.
 
@@ -8,12 +15,12 @@ Temporary CUDA policy for this repo: CUDA `13.2` is excluded due to corrupt `lla
 
 * Windows 10/11 x64
 * PowerShell 7
-* Recent **NVIDIA driver** (no CUDA toolkit required)
+* Recent GPU driver for your selected backend
 * ~20 GB free disk space
 * **App Installer / winget** available (to install dependencies)
 * **Administrator** rights (elevated PowerShell)
 
-> The GPU SM auto-detect uses `nvml.dll` from the NVIDIA driver. If NVML isn’t available, the script falls back to a WMI-based heuristic and then to `CMAKE_CUDA_ARCHITECTURES=native`.
+> The CUDA path still uses `nvml.dll` from the NVIDIA driver for SM auto-detect. If NVML isn’t available, the script falls back to a WMI-based heuristic and then to `CMAKE_CUDA_ARCHITECTURES=native`.
 
 ## What the installer does
 
@@ -24,12 +31,12 @@ Temporary CUDA policy for this repo: CUDA `13.2` is excluded due to corrupt `lla
    * CMake
    * **Visual Studio 2022 Build Tools** with the C++ toolchain and Windows SDK
    * Ninja (and a portable fallback if needed)
-3. **Chooses CUDA Toolkit**:
+3. **Chooses a backend**:
 
-   * Detects your GPU’s **SM** via NVML.
-   * **SM < 70 (pre-Turing)** → installs/uses **CUDA 12.4**.
-   * **SM ≥ 70** or unknown → uses the newest compatible installed CUDA (≥ 12.4, currently capped at 13.1).
-   * If `winget` reports a newer compatible CUDA toolkit, the script prompts whether to upgrade or keep the current install.
+   * `auto` picks `cuda`, `vulkan`, or `cpu` from the detected adapter vendor.
+   * `cuda` detects your GPU’s **SM** via NVML and installs or selects a compatible CUDA toolkit.
+   * `vulkan` installs or uses the **Vulkan SDK**.
+   * `cpu` skips GPU SDK installation entirely.
 4. **Clones and builds `llama.cpp`** under `vendor\llama.cpp`.
 
 ## Installation
@@ -40,8 +47,21 @@ Run from an **elevated** PowerShell prompt:
 # Allow script execution for this session
 Set-ExecutionPolicy Bypass -Scope Process
 
-# Run the installer (auto-detects GPU SM; falls back to native)
+# Run the installer (auto-selects backend from the detected GPU)
 ./install_llama_cpp.ps1
+```
+
+Explicit backend controls:
+
+```powershell
+# AMD / Intel on Windows
+./install_llama_cpp.ps1 -Backend vulkan
+
+# Force a CPU-only build
+./install_llama_cpp.ps1 -Backend cpu
+
+# Force the NVIDIA path
+./install_llama_cpp.ps1 -Backend cuda
 ```
 
 Explicit CUDA version controls:
@@ -69,14 +89,25 @@ The built binaries will be in:
 vendor\llama.cpp\build\bin
 ```
 
+To verify which runtime devices the built binary can see:
+
+```powershell
+.\vendor\llama.cpp\build\bin\llama-server.exe --list-devices
+```
+
+On an AMD or Intel Vulkan build, you should see a Vulkan device in that list. On a CPU-only build, use `--device none` at runtime to force CPU execution.
+
 If you already have `llama.cpp` installed and just want to rebuild against a safe toolkit:
 
 ```powershell
 ./rebuild_llama_cpp.ps1
 
+# Rebuild for an AMD or Intel machine
+./rebuild_llama_cpp.ps1 -Backend vulkan
+
 # Or pin the rebuild to a specific installed toolkit
-./rebuild_llama_cpp.ps1 -PinnedCudaVersion 13.1
-./rebuild_llama_cpp.ps1 -PinnedCudaVersion 13.0
+./rebuild_llama_cpp.ps1 -Backend cuda -PinnedCudaVersion 13.1
+./rebuild_llama_cpp.ps1 -Backend cuda -PinnedCudaVersion 13.0
 ```
 
 ## Uninstallation
@@ -113,6 +144,8 @@ To run the server, use the following command in PowerShell:
 * **winget not found**: Install “App Installer” from the Microsoft Store, then re-run.
 * **Pending reboot**: Some installs require a reboot (Windows Update/VS Installer). Reboot and re-run.
 * **CUDA side-by-side**: Multiple CUDA toolkits can co-exist. You do not need to uninstall CUDA 13.2 if CUDA 13.1 or 13.0 is also installed; the scripts will select the pinned/capped version.
+* **AMD / Intel on Windows**: Prefer `-Backend vulkan`. ROCm/HIP exists in `llama.cpp`, but it is not the primary path this repo automates on Windows.
+* **Vulkan SDK missing**: The script installs the Vulkan SDK when `-Backend vulkan` is selected. If detection still fails, reinstall the LunarG Vulkan SDK and re-run.
 * **NVML missing**: The script falls back to a heuristic and then `CMAKE_CUDA_ARCHITECTURES=native`.
 * **Locked files**: Stop `llama-server`/`llama-cli` before uninstalling.
 

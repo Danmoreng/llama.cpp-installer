@@ -13,6 +13,8 @@
 [CmdletBinding()]
 param(
     [switch]$SkipBuild,
+    [ValidateSet('auto', 'cuda', 'vulkan', 'cpu')]
+    [string]$Backend = 'auto',
     [version]$PinnedCudaVersion,
     [version]$MaxCudaVersion = [version]'13.1'
 )
@@ -64,6 +66,46 @@ function Test-VSTools {
     if (-not ($rc -and $mt)) { return $false }
 
     return $true
+}
+
+function Get-GraphicsAdapters {
+    try {
+        @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
+    } catch {
+        @()
+    }
+}
+
+function Get-GraphicsSummary {
+    $gpus = Get-GraphicsAdapters
+    $names = @($gpus | ForEach-Object { $_.Name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+    [pscustomobject]@{
+        Devices   = $gpus
+        Names     = $names
+        HasNvidia = $null -ne ($gpus | Where-Object {
+            $_.AdapterCompatibility -match 'NVIDIA' -or $_.Name -match 'NVIDIA|GeForce|RTX|GTX|Quadro|Tesla'
+        } | Select-Object -First 1)
+        HasAmd    = $null -ne ($gpus | Where-Object {
+            $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon'
+        } | Select-Object -First 1)
+        HasIntel  = $null -ne ($gpus | Where-Object {
+            $_.AdapterCompatibility -match 'Intel' -or $_.Name -match 'Intel'
+        } | Select-Object -First 1)
+    }
+}
+
+function Resolve-Backend {
+    param([Parameter(Mandatory = $true)][string]$Requested)
+
+    if ($Requested -ne 'auto') {
+        return $Requested
+    }
+
+    $graphics = Get-GraphicsSummary
+    if ($graphics.HasNvidia) { return 'cuda' }
+    if ($graphics.HasAmd -or $graphics.HasIntel) { return 'vulkan' }
+    return 'cpu'
 }
 
 # --- CUDA: generic discovery (12.4+ including 13.x) -------------------------
@@ -152,6 +194,61 @@ function Test-CUDAExact {
         $_.Version.Major -eq $target.Major -and $_.Version.Minor -eq $target.Minor
     } | Select-Object -First 1
     return $null -ne $hit
+}
+
+function Get-VulkanSdkInstalls {
+    $roots = @()
+
+    if ($env:VULKAN_SDK -and (Test-Path $env:VULKAN_SDK)) {
+        $roots += $env:VULKAN_SDK
+    }
+
+    $defaultRoot = 'C:\VulkanSDK'
+    if (Test-Path $defaultRoot) {
+        $roots += Get-ChildItem $defaultRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+    }
+
+    $roots |
+        Sort-Object -Unique |
+        ForEach-Object {
+            $root = $_
+            $glslc = Join-Path $root 'Bin\glslc.exe'
+            $lib = Join-Path $root 'Lib\vulkan-1.lib'
+            $header = Join-Path $root 'Include\vulkan\vulkan.h'
+            if ((Test-Path $glslc) -and (Test-Path $lib) -and (Test-Path $header)) {
+                [pscustomobject]@{
+                    Root    = $root
+                    Bin     = Join-Path $root 'Bin'
+                    Glslc   = $glslc
+                    Lib     = $lib
+                    Include = Join-Path $root 'Include'
+                }
+            }
+        } |
+        Sort-Object Root -Descending
+}
+
+function Test-VulkanSdk {
+    (Get-VulkanSdkInstalls | Select-Object -First 1) -ne $null
+}
+
+function Use-VulkanSdk {
+    $sdk = Get-VulkanSdkInstalls | Select-Object -First 1
+    if (-not $sdk) {
+        throw "No Vulkan SDK installation was found. Install the LunarG Vulkan SDK and re-run the script."
+    }
+
+    $env:VULKAN_SDK = $sdk.Root
+    if (-not ($env:Path -split ';' | Where-Object { $_ -ieq $sdk.Bin })) {
+        $env:Path = "$($sdk.Bin);$env:Path"
+    }
+
+    Write-Host "  Using Vulkan SDK at $($sdk.Root)"
+    @(
+        "-DVulkan_INCLUDE_DIR=$($sdk.Include)"
+        "-DVulkan_LIBRARY=$($sdk.Lib)"
+        "-DVulkan_GLSLC_EXECUTABLE=$($sdk.Glslc)"
+    )
 }
 
 function Install-CUDA124-FromNVIDIA {
@@ -375,6 +472,13 @@ function Refresh-Env {
             break
         }
     }
+
+    if (-not $env:VULKAN_SDK) {
+        $sdk = Get-VulkanSdkInstalls | Select-Object -First 1
+        if ($sdk) {
+            $env:VULKAN_SDK = $sdk.Root
+        }
+    }
 }
 
 function Ensure-CommandAvailable([string]$Cmd, [int]$TimeoutMin = 5) {
@@ -496,6 +600,7 @@ function Install-VSTools {
 
 function Wait-VSToolsReady { Wait-Until { Test-VSTools } 20 'Visual Studio Build Tools' }
 function Wait-CUDAReady    { Wait-Until { Test-CUDA    } 30 'CUDA Toolkit' }
+function Wait-VulkanSdkReady { Wait-Until { Test-VulkanSdk } 10 'Vulkan SDK' }
 
 # Bring MSVC variables (cl, link, lib paths, etc.) into this PowerShell session
 function Import-VSEnv {
@@ -538,38 +643,45 @@ function Install-NinjaPortable {
     Write-Host "[OK] Ninja"
 }
 
-# If the selected CUDA toolkit changed since the last configure, clear the cache
-# so CMake picks up the matching nvcc/compiler settings for the new toolkit.
-function Reset-CMakeCacheIfCudaChanged {
+# If the selected backend or toolchain changed since the last configure, clear
+# the cache so CMake does not try to reuse incompatible settings.
+function Reset-CMakeCacheIfBuildSignatureChanged {
     param(
         [Parameter(Mandatory = $true)][string]$BuildDir,
-        [Parameter(Mandatory = $true)][string]$CudaRoot
+        [Parameter(Mandatory = $true)][string]$Signature
     )
 
+    $signaturePath = Join-Path $BuildDir '.llama-installer-build-signature'
+    $previousSignature = if (Test-Path $signaturePath) { Get-Content $signaturePath -Raw } else { $null }
+
+    if ($previousSignature -eq $Signature) { return }
+
     $cachePath = Join-Path $BuildDir 'CMakeCache.txt'
-    if (-not (Test-Path $cachePath)) { return }
-
-    $cacheText = Get-Content $cachePath -Raw
-    $expectedRoot = $CudaRoot.Replace('\', '/')
-    $expectedNvcc = (Join-Path $CudaRoot 'bin\nvcc.exe').Replace('\', '/')
-    $configuredForRoot = $cacheText -match [regex]::Escape($expectedRoot)
-    $configuredForNvcc = $cacheText -match [regex]::Escape($expectedNvcc)
-
-    if ($configuredForRoot -and $configuredForNvcc) { return }
-
     $resolvedBuildDir = (Resolve-Path -LiteralPath $BuildDir).Path
     $resolvedRepoRoot = (Resolve-Path -LiteralPath (Join-Path $ScriptRoot 'vendor\llama.cpp')).Path
     if (-not $resolvedBuildDir.StartsWith($resolvedRepoRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing to reset CMake cache outside the vendored llama.cpp tree: $resolvedBuildDir"
     }
 
-    Write-Host "-> CUDA toolkit changed; clearing cached CMake configuration in $resolvedBuildDir" -ForegroundColor Yellow
-    Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+    if (Test-Path $cachePath) {
+        Write-Host "-> Build backend changed; clearing cached CMake configuration in $resolvedBuildDir" -ForegroundColor Yellow
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+    }
 
     $cacheDir = Join-Path $BuildDir 'CMakeFiles'
     if (Test-Path $cacheDir) {
         Remove-Item -LiteralPath $cacheDir -Recurse -Force
     }
+}
+
+function Set-BuildSignature {
+    param(
+        [Parameter(Mandatory = $true)][string]$BuildDir,
+        [Parameter(Mandatory = $true)][string]$Signature
+    )
+
+    $signaturePath = Join-Path $BuildDir '.llama-installer-build-signature'
+    Set-Content -LiteralPath $signaturePath -Value $Signature -NoNewline
 }
 
 # Select newest CUDA (>=12.4), export env, return CMake arg
@@ -727,68 +839,95 @@ $reqs = @(
     }
 )
 
-# --- Detect GPU and select appropriate CUDA toolkit version ---
-$DetectedSm = Get-GpuCudaArch
-
-$cudaReq = @{
-    Name    = 'CUDA Toolkit'
-    Test    = { Test-CompatibleCudaInstalled -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $EffectivePinnedCudaVersion }
-    Id      = 'Nvidia.CUDA'
-    Version = ''
-}
+$SelectedBackend = Resolve-Backend -Requested $Backend
+$GraphicsSummary = Get-GraphicsSummary
+$DetectedSm = $null
 $RequiredCudaVersion = [version]'12.4'
 $MaxCompatibleCudaVersion = $MaxCudaVersion
 $EffectivePinnedCudaVersion = $PinnedCudaVersion
+$HadCompatibleCudaBeforeInstall = $false
+$backendPrereq = $null
 
-if ($DetectedSm) {
-    if ($DetectedSm -lt 70) {
-        if ($PinnedCudaVersion -and (Get-CudaVersionKey -Version $PinnedCudaVersion) -ne [version]'12.4') {
-            throw "Detected sm_$DetectedSm requires CUDA 12.4 for compatibility. Requested pinned CUDA version: $($PinnedCudaVersion.ToString(2))."
+if ($GraphicsSummary.Names.Count -gt 0) {
+    Write-Host ("-> Detected display adapters: {0}" -f ($GraphicsSummary.Names -join '; '))
+}
+Write-Host ("-> Selected backend: {0}" -f $SelectedBackend) -ForegroundColor Cyan
+
+switch ($SelectedBackend) {
+    'cuda' {
+        $DetectedSm = Get-GpuCudaArch
+        $backendPrereq = @{
+            Name    = 'CUDA Toolkit'
+            Test    = { Test-CompatibleCudaInstalled -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $EffectivePinnedCudaVersion }
+            Id      = 'Nvidia.CUDA'
+            Version = ''
         }
-        Write-Host "-> GPU detected: sm_$DetectedSm (pre-Turing) – selecting CUDA 12.4 for compatibility."
-        $cudaReq.Name    = 'CUDA Toolkit 12.4'
-        $cudaReq.Version = '12.4.1'
-        $cudaReq.Test    = { Test-CUDAExact -MajorMinor '12.4' }
-        $RequiredCudaVersion = [version]'12.4'
-        $MaxCompatibleCudaVersion = [version]'12.4'
-        $EffectivePinnedCudaVersion = [version]'12.4'
-    } elseif ($DetectedSm -ge 100) {
-        Write-Host "-> GPU detected: sm_$DetectedSm (Blackwell) – selecting CUDA 12.8+ for optimal performance."
-        $cudaReq.Name    = 'CUDA Toolkit 12.8'
-        $cudaReq.Version = '12.8.0'
-        $RequiredCudaVersion = [version]'12.8'
-    } else {
-        Write-Host "-> GPU detected: sm_$DetectedSm – selecting latest CUDA."
+
+        if ($DetectedSm) {
+            if ($DetectedSm -lt 70) {
+                if ($PinnedCudaVersion -and (Get-CudaVersionKey -Version $PinnedCudaVersion) -ne [version]'12.4') {
+                    throw "Detected sm_$DetectedSm requires CUDA 12.4 for compatibility. Requested pinned CUDA version: $($PinnedCudaVersion.ToString(2))."
+                }
+                Write-Host "-> GPU detected: sm_$DetectedSm (pre-Turing) – selecting CUDA 12.4 for compatibility."
+                $backendPrereq.Name    = 'CUDA Toolkit 12.4'
+                $backendPrereq.Version = '12.4.1'
+                $backendPrereq.Test    = { Test-CUDAExact -MajorMinor '12.4' }
+                $RequiredCudaVersion = [version]'12.4'
+                $MaxCompatibleCudaVersion = [version]'12.4'
+                $EffectivePinnedCudaVersion = [version]'12.4'
+            } elseif ($DetectedSm -ge 100) {
+                Write-Host "-> GPU detected: sm_$DetectedSm (Blackwell) – selecting CUDA 12.8+ for optimal performance."
+                $backendPrereq.Name    = 'CUDA Toolkit 12.8'
+                $backendPrereq.Version = '12.8.0'
+                $RequiredCudaVersion = [version]'12.8'
+            } else {
+                Write-Host "-> GPU detected: sm_$DetectedSm – selecting latest CUDA."
+            }
+        } else {
+            Write-Host "-> GPU SM could not be determined pre-install – selecting latest CUDA."
+        }
+
+        if ($MaxCompatibleCudaVersion) {
+            $requiredKey = Get-CudaVersionKey -Version $RequiredCudaVersion
+            $maxKey = Get-CudaVersionKey -Version $MaxCompatibleCudaVersion
+            if ($maxKey -lt $requiredKey) {
+                throw "Configured MaxCudaVersion $($MaxCompatibleCudaVersion.ToString(2)) is below the required CUDA version $($RequiredCudaVersion.ToString(2))."
+            }
+        }
+
+        if ($EffectivePinnedCudaVersion) {
+            $requiredKey = Get-CudaVersionKey -Version $RequiredCudaVersion
+            $pinnedKey = Get-CudaVersionKey -Version $EffectivePinnedCudaVersion
+            if ($pinnedKey -lt $requiredKey) {
+                throw "Configured PinnedCudaVersion $($EffectivePinnedCudaVersion.ToString(2)) is below the required CUDA version $($RequiredCudaVersion.ToString(2))."
+            }
+        }
+
+        if ($EffectivePinnedCudaVersion) {
+            Write-Host ("-> CUDA pin active: {0}" -f $EffectivePinnedCudaVersion.ToString(2)) -ForegroundColor Cyan
+        } elseif ($MaxCompatibleCudaVersion) {
+            Write-Host ("-> CUDA cap active: using/installing at most CUDA {0}" -f $MaxCompatibleCudaVersion.ToString(2)) -ForegroundColor Cyan
+        }
+
+        $HadCompatibleCudaBeforeInstall = (Get-CompatibleCudaInstalls -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $EffectivePinnedCudaVersion | Select-Object -First 1) -ne $null
     }
-} else {
-    Write-Host "-> GPU SM could not be determined pre-install – selecting latest CUDA."
-}
-
-if ($MaxCompatibleCudaVersion) {
-    $requiredKey = Get-CudaVersionKey -Version $RequiredCudaVersion
-    $maxKey = Get-CudaVersionKey -Version $MaxCompatibleCudaVersion
-    if ($maxKey -lt $requiredKey) {
-        throw "Configured MaxCudaVersion $($MaxCompatibleCudaVersion.ToString(2)) is below the required CUDA version $($RequiredCudaVersion.ToString(2))."
+    'vulkan' {
+        $backendPrereq = @{
+            Name = 'Vulkan SDK'
+            Test = { Test-VulkanSdk }
+            Id   = 'KhronosGroup.VulkanSDK'
+            Cmd  = 'glslc'
+        }
+        Write-Host "-> Vulkan backend selected. This is the recommended Windows path for AMD and Intel GPUs."
+    }
+    'cpu' {
+        Write-Host "-> CPU backend selected. GPU acceleration will be disabled at build time."
     }
 }
 
-if ($EffectivePinnedCudaVersion) {
-    $requiredKey = Get-CudaVersionKey -Version $RequiredCudaVersion
-    $pinnedKey = Get-CudaVersionKey -Version $EffectivePinnedCudaVersion
-    if ($pinnedKey -lt $requiredKey) {
-        throw "Configured PinnedCudaVersion $($EffectivePinnedCudaVersion.ToString(2)) is below the required CUDA version $($RequiredCudaVersion.ToString(2))."
-    }
+if ($backendPrereq) {
+    $reqs += $backendPrereq
 }
-
-if ($EffectivePinnedCudaVersion) {
-    Write-Host ("-> CUDA pin active: {0}" -f $EffectivePinnedCudaVersion.ToString(2)) -ForegroundColor Cyan
-} elseif ($MaxCompatibleCudaVersion) {
-    Write-Host ("-> CUDA cap active: using/installing at most CUDA {0}" -f $MaxCompatibleCudaVersion.ToString(2)) -ForegroundColor Cyan
-}
-
-$reqs += $cudaReq
-
-$HadCompatibleCudaBeforeInstall = (Get-CompatibleCudaInstalls -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $EffectivePinnedCudaVersion | Select-Object -First 1) -ne $null
 
 
 # --- Install all prerequisites ---
@@ -812,6 +951,10 @@ foreach ($r in $reqs) {
                     $have = ((Get-CudaInstalls).Version | ForEach-Object { $_.ToString(2) }) -join ', '
                     throw "CUDA 12.4 did not get installed. Installed versions: $have"
                 }
+            }
+            'Vulkan SDK' {
+                Install-Winget -Id $r.Id
+                Wait-VulkanSdkReady
             }
             default {
                 $installerArgs = $r.ContainsKey('InstallerArgs') ? $r['InstallerArgs'] : ''
@@ -850,7 +993,7 @@ if (-not (Test-Command ninja)) {
 
 if ($SkipBuild) { Write-Host 'SkipBuild set – done.'; return }
 
-if ($HadCompatibleCudaBeforeInstall) {
+if ($SelectedBackend -eq 'cuda' -and $HadCompatibleCudaBeforeInstall) {
     $installedCuda = Get-CompatibleCudaInstalls -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $EffectivePinnedCudaVersion | Select-Object -First 1
     $availableCuda = Get-LatestCompatibleInstallableCudaVersion -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $EffectivePinnedCudaVersion
 
@@ -864,21 +1007,54 @@ if ($HadCompatibleCudaBeforeInstall) {
     }
 }
 
-$hasCompatible = Get-CompatibleCudaInstalls -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $EffectivePinnedCudaVersion | Select-Object -First 1
-if (-not $hasCompatible) {
-    $expected = if ($EffectivePinnedCudaVersion) {
-        $EffectivePinnedCudaVersion.ToString(2)
-    } elseif ($MaxCompatibleCudaVersion) {
-        "$($RequiredCudaVersion.ToString(2)) through $($MaxCompatibleCudaVersion.ToString(2))"
-    } else {
-        "$($RequiredCudaVersion.ToString(2)) or newer"
-    }
-    $have = ((Get-CudaInstalls).Version | ForEach-Object { $_.ToString(2) }) -join ', '
-    throw "CUDA $expected did not get installed. Installed versions: $have"
-}
+$backendCmakeArgs = @()
+$BuildSignature = "backend=$SelectedBackend"
 
-# --- Select CUDA toolkit and auto-detect architecture ---
-$cudaRootArg = Use-LatestCuda -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $EffectivePinnedCudaVersion
+switch ($SelectedBackend) {
+    'cuda' {
+        $hasCompatible = Get-CompatibleCudaInstalls -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $EffectivePinnedCudaVersion | Select-Object -First 1
+        if (-not $hasCompatible) {
+            $expected = if ($EffectivePinnedCudaVersion) {
+                $EffectivePinnedCudaVersion.ToString(2)
+            } elseif ($MaxCompatibleCudaVersion) {
+                "$($RequiredCudaVersion.ToString(2)) through $($MaxCompatibleCudaVersion.ToString(2))"
+            } else {
+                "$($RequiredCudaVersion.ToString(2)) or newer"
+            }
+            $have = ((Get-CudaInstalls).Version | ForEach-Object { $_.ToString(2) }) -join ', '
+            throw "CUDA $expected did not get installed. Installed versions: $have"
+        }
+
+        $cudaRootArg = Use-LatestCuda -Min $RequiredCudaVersion -Max $MaxCompatibleCudaVersion -Pinned $EffectivePinnedCudaVersion
+        $CudaArchArg = $DetectedSm ? "$DetectedSm" : 'native'
+        if ($DetectedSm) {
+            Write-Host ("-> Using detected compute capability sm_{0}" -f $DetectedSm)
+        } else {
+            Write-Host "-> Using CMAKE_CUDA_ARCHITECTURES=native (toolkit will detect during compile)."
+        }
+
+        $backendCmakeArgs += '-DGGML_CUDA=ON'
+        $backendCmakeArgs += '-DGGML_CUBLAS=ON'
+        $backendCmakeArgs += '-DGGML_VULKAN=OFF'
+        $backendCmakeArgs += '-DGGML_CUDA_FA_ALL_QUANTS=ON'
+        $backendCmakeArgs += "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchArg"
+        if ($cudaRootArg) {
+            $backendCmakeArgs += $cudaRootArg
+        }
+        $BuildSignature = "$BuildSignature;cuda=$($env:CUDA_PATH);arch=$CudaArchArg"
+    }
+    'vulkan' {
+        $vulkanArgs = Use-VulkanSdk
+        $backendCmakeArgs += '-DGGML_CUDA=OFF'
+        $backendCmakeArgs += '-DGGML_VULKAN=ON'
+        $backendCmakeArgs += $vulkanArgs
+        $BuildSignature = "$BuildSignature;vulkan=$($env:VULKAN_SDK)"
+    }
+    'cpu' {
+        $backendCmakeArgs += '-DGGML_CUDA=OFF'
+        $backendCmakeArgs += '-DGGML_VULKAN=OFF'
+    }
+}
 
 # ---------------------------------------------------------------------------
 # Clone & build ggerganov/llama.cpp
@@ -900,18 +1076,9 @@ if (-not (Test-Path $LlamaRepo)) {
 git -C $LlamaRepo submodule update --init --recursive
 Assert-LastExitCode "git submodule update"
 
-# --- configure & build ------------------------------------------------------
-# Prepare CMake CUDA architectures argument
-$CudaArchArg = $DetectedSm ? "$DetectedSm" : 'native'
-if ($DetectedSm) {
-    Write-Host ("-> Using detected compute capability sm_{0}" -f $DetectedSm)
-} else {
-    Write-Host "-> Using CMAKE_CUDA_ARCHITECTURES=native (toolkit will detect during compile)."
-}
-
 Refresh-Env
 New-Item $LlamaBuild -ItemType Directory -Force | Out-Null
-Reset-CMakeCacheIfCudaChanged -BuildDir $LlamaBuild -CudaRoot $env:CUDA_PATH
+Reset-CMakeCacheIfBuildSignatureChanged -BuildDir $LlamaBuild -Signature $BuildSignature
 Import-VSEnv   # make cl.exe etc. available in this session after any env refreshes/install steps
 Push-Location $LlamaBuild
 
@@ -919,15 +1086,10 @@ try {
     Write-Host '-> generating upstream llama.cpp solution ...'
     $cmakeArgs = @(
         '..', '-G', 'Ninja',
-        '-DGGML_CUDA=ON', '-DGGML_CUBLAS=ON',
         '-DCMAKE_BUILD_TYPE=Release',
-        '-DLLAMA_CURL=OFF',
-        '-DGGML_CUDA_FA_ALL_QUANTS=ON',
-        "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchArg"
+        '-DLLAMA_CURL=OFF'
     )
-    if ($cudaRootArg) {
-        $cmakeArgs += $cudaRootArg
-    }
+    $cmakeArgs += $backendCmakeArgs
 
     $hasNativeOpenSSL = $env:OPENSSL_ROOT_DIR -and `
         (Test-Path $env:OPENSSL_ROOT_DIR) -and `
@@ -944,6 +1106,7 @@ try {
 
     cmake @cmakeArgs
     Assert-LastExitCode "cmake configure"
+    Set-BuildSignature -BuildDir $LlamaBuild -Signature $BuildSignature
 
     Write-Host '-> building upstream llama.cpp tools (Release) ...'
     cmake --build . --config Release --target llama-server llama-batched-bench llama-cli llama-bench llama-fit-params --parallel
