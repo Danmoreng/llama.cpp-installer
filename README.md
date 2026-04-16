@@ -139,7 +139,9 @@ To run the server, use the following command in PowerShell:
 ./run_llama_cpp_server.ps1
 ```
 
-For a dedicated single-model launcher, `run_gemma4_26b_a4b_server.ps1` starts the `gemma-4-26B-A4B-it-Q4_K_M` variant directly instead of using router mode. It is tuned for local coding use with `ngram-mod` enabled by default, a larger micro-batch (`-ub 512`), KV cache quantization (`-ctk q8_0 -ctv q8_0`), and the same auto-fit behavior used elsewhere in the repo. Use it when you specifically want the Gemma 4 26B Q4 coding setup rather than the generic multi-model router.
+### Gemma Code Editing Preset
+
+For a dedicated single-model launcher, `run_gemma4_26b_a4b_server.ps1` starts the `gemma-4-26B-A4B-it-Q4_K_M` variant directly instead of using router mode. It is tuned for local code editing with `ngram-mod` enabled by default using a more conservative profile (`--spec-ngram-size-n 24 --draft-min 4 --draft-max 24`), a lower-temperature sampling profile (`temp=0.2`, `top_p=0.9`, `top_k=40`, `min_p=0.01`), reasoning disabled, a larger micro-batch (`-ub 512`), KV cache quantization (`-ctk q8_0 -ctv q8_0`), and the same auto-fit behavior used elsewhere in the repo. Use it when you specifically want the Gemma 4 26B Q4 coding setup rather than the generic multi-model router.
 
 ## Troubleshooting
 

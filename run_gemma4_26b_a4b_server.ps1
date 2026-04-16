@@ -114,27 +114,28 @@ $Args = @(
     '-ub',                 $UBatchSize,
     '-ctk',                'q8_0',
     '-ctv',                'q8_0',
-    '--temp',              '1.0',
-    '--top-p',             '0.95',
+    '--temp',              '0.2',
+    '--top-p',             '0.9',
     '--top-k',             '40',
     '--min-p',             '0.01',
     '--presence-penalty',  '0.0',
+    '--reasoning',         'off',
     '--host',              '0.0.0.0'
 )
 
 if (-not $DisableNgramMod) {
     $Args += @(
         '--spec-type',         'ngram-mod',
-        '--spec-ngram-size-n', '18',
-        '--draft-min',         '6',
-        '--draft-max',         '48'
+        '--spec-ngram-size-n', '24',
+        '--draft-min',         '4',
+        '--draft-max',         '24'
     )
 }
 
 $SpecDescription = if ($DisableNgramMod) {
     'disabled'
 } else {
-    'enabled (ngram-mod, n=18, draft 6..48)'
+    'enabled (ngram-mod, n=24, draft 4..24)'
 }
 
 Write-Host "-> Model: $ModelPath"
@@ -143,7 +144,8 @@ Write-Host "-> Threads: $threads"
 Write-Host "-> Fit context floor: $FitContext"
 Write-Host "-> Fit target margin: $FitTargetMB MiB"
 Write-Host "-> Speculative decoding: $SpecDescription"
-Write-Host "-> Gemma 4 sampling: temp=1.0 top_p=0.95 top_k=40 min_p=0.01"
+Write-Host "-> Gemma 4 sampling: temp=0.2 top_p=0.9 top_k=40 min_p=0.01"
+Write-Host "-> Gemma 4 reasoning: off"
 
 Write-Host "-> Starting Gemma 4 26B A4B server on http://localhost:8080 ..."
 Start-Process -FilePath $ServerExe -ArgumentList $Args -NoNewWindow
