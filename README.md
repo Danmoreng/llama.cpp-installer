@@ -123,11 +123,11 @@ This removes the winget-installed prerequisites and the `vendor` directory (and 
 
 ## Running the Server
 
-The `run_llama_cpp_server.ps1` script starts `llama-server.exe` in router mode with a single default model configured in the script.
+The `run_llama_cpp_server.ps1` script starts `llama-server.exe` in generic router mode over the `models` directory.
 
-1.  **Downloads the model**: It automatically downloads the configured GGUF file into the `models` directory if it is not already present.
-2.  **Starts the server**: It launches `llama-server.exe` in router mode and lets `llama.cpp` auto-fit GPU layers and context.
-3.  **Opens Web UI**: After starting the server, it automatically opens `http://localhost:8080` in your default web browser.
+1.  **Downloads one default model**: It automatically downloads the configured GGUF file into the `models` directory if it is not already present.
+2.  **Starts the router**: It launches `llama-server.exe` with `--models-dir` so every GGUF in `.\models` is available through the router.
+3.  **Auto-fits runtime parameters**: It lets `llama.cpp` auto-fit GPU layers and context, and opens `http://localhost:8080` in your default web browser.
 
 The current default model is:
 
@@ -138,6 +138,8 @@ To run the server, use the following command in PowerShell:
 ```powershell
 ./run_llama_cpp_server.ps1
 ```
+
+For a dedicated single-model launcher, `run_gemma4_26b_a4b_server.ps1` starts the `gemma-4-26B-A4B-it-Q4_K_M` variant directly instead of using router mode. It is tuned for local coding use with `ngram-mod` enabled by default, a larger micro-batch (`-ub 512`), KV cache quantization (`-ctk q8_0 -ctv q8_0`), and the same auto-fit behavior used elsewhere in the repo. Use it when you specifically want the Gemma 4 26B Q4 coding setup rather than the generic multi-model router.
 
 ## Troubleshooting
 

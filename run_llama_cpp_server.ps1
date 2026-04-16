@@ -74,7 +74,7 @@ $Args = @(
 
     # Optimized batching for consumer GPUs
     '-b', '1024',
-    '-ub', '256',
+    '-ub', '512',
 
     # KV-cache quantization (VRAM efficiency for large contexts)
     '-ctk', 'q8_0',
