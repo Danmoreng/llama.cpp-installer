@@ -2,11 +2,11 @@
     ----------------------------------------------------------
     Dedicated launcher for Gemma 4 26B A4B (MoE) in llama.cpp.
     Tuned for local coding use on a single-GPU Windows machine,
-    with ngram-mod enabled by default for iterative code editing.
+    with ngram-map-k speculative decoding enabled by default for
+    iterative code editing.
 #>
 
 param(
-    [switch]$DisableNgramMod,
     [switch]$NoBrowser,
     [int]$FitContext = 32768,
     [int]$FitTargetMB = 256,
@@ -18,68 +18,16 @@ $ErrorActionPreference = 'Stop'
 
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $ServerExe  = Join-Path $ScriptRoot 'vendor\llama.cpp\build\bin\llama-server.exe'
-$ModelDir   = Join-Path $ScriptRoot 'models'
-
-# Prefer an existing local Q4_K_M GGUF to avoid re-downloading ~17 GiB.
-$PreferredModelNames = @(
-    'gemma-4-26B-A4B-it-Q4_K_M.gguf',
-    'gemma-4-26B-A4B-it-UD-Q4_K_M.gguf'
-)
-
-$ModelUrl = 'https://huggingface.co/ggml-org/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-Q4_K_M.gguf'
-$ModelAlias = 'gemma-4-26b-a4b-code'
-
-function Download-IfNeeded {
-    param(
-        [Parameter(Mandatory = $true)][string]$Url,
-        [Parameter(Mandatory = $true)][string]$Destination
-    )
-
-    if (Test-Path $Destination) {
-        Write-Host "[OK] Cached -> $Destination"
-        return
-    }
-
-    New-Item -ItemType Directory -Path (Split-Path $Destination) -Force | Out-Null
-    Write-Host "-> Downloading Gemma 4 GGUF: $Url"
-
-    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
-    if ($null -ne $curl) {
-        & $curl.Source -L --fail --retry 5 --retry-delay 5 --output $Destination $Url
-        if ($LASTEXITCODE -ne 0) {
-            throw "Download failed from '$Url' (curl exit code $LASTEXITCODE)."
-        }
-    } else {
-        Invoke-WebRequest -Uri $Url -OutFile $Destination -ErrorAction Stop
-    }
-}
-
-function Resolve-ModelPath {
-    foreach ($name in $PreferredModelNames) {
-        $candidate = Join-Path $ModelDir $name
-        if (Test-Path $candidate) {
-            return $candidate
-        }
-    }
-
-    $existing = Get-ChildItem -Path $ModelDir -Filter '*gemma-4-26B-A4B*Q4*K*M*.gguf' -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-
-    if ($null -ne $existing) {
-        return $existing.FullName
-    }
-
-    $downloadTarget = Join-Path $ModelDir 'gemma-4-26B-A4B-it-Q4_K_M.gguf'
-    Download-IfNeeded -Url $ModelUrl -Destination $downloadTarget
-    return $downloadTarget
-}
+$ModelPath  = Join-Path $ScriptRoot 'models\gemma-4-26B-A4B-it-MXFP4_MOE.gguf'
+$ModelAlias = 'gemma-4-26b-a4b-mxfp4-moe-code'
 
 if (-not (Test-Path $ServerExe)) {
     throw "llama-server.exe not found at '$ServerExe'. Run .\install_llama_cpp.ps1 first."
 }
 
-$ModelPath = Resolve-ModelPath
+if (-not (Test-Path $ModelPath)) {
+    throw "Gemma MXFP4 model not found at '$ModelPath'. Place gemma-4-26B-A4B-it-MXFP4_MOE.gguf in .\models first."
+}
 
 # Prefer physical cores when WMI is accessible. Sandbox-restricted sessions can
 # fall back to half the logical cores, which is still reasonable for Windows.
@@ -120,30 +68,19 @@ $Args = @(
     '--min-p',             '0.01',
     '--presence-penalty',  '0.0',
     '--reasoning',         'off',
-    '--host',              '0.0.0.0'
+    '--host',              '0.0.0.0',
+    '--spec-type',                  'ngram-map-k',
+    '--spec-ngram-map-k-size-n',    '16',
+    '--spec-draft-n-min',           '12',
+    '--spec-draft-n-max',           '48'
 )
-
-if (-not $DisableNgramMod) {
-    $Args += @(
-        '--spec-type',         'ngram-mod',
-        '--spec-ngram-size-n', '24',
-        '--draft-min',         '4',
-        '--draft-max',         '24'
-    )
-}
-
-$SpecDescription = if ($DisableNgramMod) {
-    'disabled'
-} else {
-    'enabled (ngram-mod, n=24, draft 4..24)'
-}
 
 Write-Host "-> Model: $ModelPath"
 Write-Host "-> Alias: $ModelAlias"
 Write-Host "-> Threads: $threads"
 Write-Host "-> Fit context floor: $FitContext"
 Write-Host "-> Fit target margin: $FitTargetMB MiB"
-Write-Host "-> Speculative decoding: $SpecDescription"
+Write-Host "-> Speculative decoding: enabled (ngram-map-k, n=16, draft 12..48)"
 Write-Host "-> Gemma 4 sampling: temp=0.2 top_p=0.9 top_k=40 min_p=0.01"
 Write-Host "-> Gemma 4 reasoning: off"
 

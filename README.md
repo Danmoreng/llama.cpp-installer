@@ -141,7 +141,34 @@ To run the server, use the following command in PowerShell:
 
 ### Gemma Code Editing Preset
 
-For a dedicated single-model launcher, `run_gemma4_26b_a4b_server.ps1` starts the `gemma-4-26B-A4B-it-Q4_K_M` variant directly instead of using router mode. It is tuned for local code editing with `ngram-mod` enabled by default using a more conservative profile (`--spec-ngram-size-n 24 --draft-min 4 --draft-max 24`), a lower-temperature sampling profile (`temp=0.2`, `top_p=0.9`, `top_k=40`, `min_p=0.01`), reasoning disabled, a larger micro-batch (`-ub 512`), KV cache quantization (`-ctk q8_0 -ctv q8_0`), and the same auto-fit behavior used elsewhere in the repo. Use it when you specifically want the Gemma 4 26B Q4 coding setup rather than the generic multi-model router.
+`run_gemma4_26b_a4b_server.ps1` starts a dedicated single-model `llama-server` for `models\gemma-4-26B-A4B-it-MXFP4_MOE.gguf`.
+
+The launcher uses:
+
+* `--alias gemma-4-26b-a4b-mxfp4-moe-code`
+* `--jinja`
+* `--flash-attn on`
+* `--fit on`
+* `--fit-target 256`
+* `--fit-ctx 32768`
+* `-b 1024`
+* `-ub 512`
+* `-ctk q8_0`
+* `-ctv q8_0`
+* `--temp 0.2`
+* `--top-p 0.9`
+* `--top-k 40`
+* `--min-p 0.01`
+* `--presence-penalty 0.0`
+* `--reasoning off`
+* `--spec-type ngram-map-k`
+* `--spec-ngram-map-k-size-n 16`
+* `--spec-draft-n-min 12`
+* `--spec-draft-n-max 48`
+* `--parallel 1`
+* `--host 0.0.0.0`
+
+It sets `LLAMA_SET_ROWS=1`, chooses a CPU thread count from the available physical cores when possible, starts the server on `http://localhost:8080`, and opens the browser unless `-NoBrowser` is passed. The model file must already exist at `models\gemma-4-26B-A4B-it-MXFP4_MOE.gguf`.
 
 ## Troubleshooting
 
