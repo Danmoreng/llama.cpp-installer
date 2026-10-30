@@ -17,7 +17,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$ServerExe  = Join-Path $ScriptRoot 'vendor\llama.cpp\build\bin\llama-server.exe'
+$ServerExe  = Join-Path $(if ($env:LLAMA_CPP_HOME) { $env:LLAMA_CPP_HOME } else { 'C:/llama.cpp' }) 'build/bin/llama-server.exe'
 $ModelPath  = Join-Path $ScriptRoot 'models\gemma-4-26B-A4B-it-MXFP4_MOE.gguf'
 $ModelAlias = 'gemma-4-26b-a4b-mxfp4-moe-code'
 

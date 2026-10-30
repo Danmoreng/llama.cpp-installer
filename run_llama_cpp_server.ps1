@@ -10,7 +10,7 @@ param()
 
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
 
-$ServerExe  = Join-Path $ScriptRoot 'vendor\llama.cpp\build\bin\llama-server.exe'
+$ServerExe  = Join-Path $(if ($env:LLAMA_CPP_HOME) { $env:LLAMA_CPP_HOME } else { 'C:/llama.cpp' }) 'build/bin/llama-server.exe'
 
 if (-not (Test-Path $ServerExe)) {
     throw "llama-server.exe not found at '$ServerExe' – check the path."

@@ -19,6 +19,18 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$sharedRoot = if ($env:LLAMA_CPP_HOME) { $env:LLAMA_CPP_HOME } else { 'C:/llama.cpp' }
+$sharedUpdater = Join-Path $sharedRoot 'update-central.ps1'
+if (Test-Path -LiteralPath $sharedUpdater) {
+    if ($Clean -or $Backend -notin @('auto', 'cuda') -or $PSBoundParameters.ContainsKey('PinnedCudaVersion') -or $PSBoundParameters.ContainsKey('MaxCudaVersion')) {
+        throw 'The shared build does not support cleaning or overriding its CUDA configuration here.'
+    }
+    $supported = @('llama-server', 'llama-cli', 'llama-completion', 'llama-bench', 'llama-quantize', 'llama-gguf', 'llama-batched-bench', 'llama-fit-params')
+    if (@($Targets | Where-Object { $_ -notin $supported }).Count -gt 0) { throw 'Requested target is not part of the shared build.' }
+    & $sharedUpdater -Jobs $Parallel
+    return
+}
+
 
 function Get-GraphicsAdapters {
     try {

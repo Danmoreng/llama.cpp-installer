@@ -19,6 +19,16 @@ param(
     [version]$MaxCudaVersion = [version]'13.1'
 )
 
+$sharedRoot = if ($env:LLAMA_CPP_HOME) { $env:LLAMA_CPP_HOME } else { 'C:/llama.cpp' }
+$sharedUpdater = Join-Path $sharedRoot 'update-central.ps1'
+if (-not $SkipBuild -and (Test-Path -LiteralPath $sharedUpdater)) {
+    if ($Backend -notin @('auto', 'cuda') -or $PSBoundParameters.ContainsKey('PinnedCudaVersion') -or $PSBoundParameters.ContainsKey('MaxCudaVersion')) {
+        throw 'The shared installation uses its own CUDA configuration. Update it directly or use a separate installation for another backend.'
+    }
+    & $sharedUpdater
+    return
+}
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
